@@ -27,6 +27,7 @@ struct nof_seg_handle;
 struct tr_info;
 struct ctrlr_info;
 class SpdkNofWorkerPool;
+struct NoFNamespaceInfo;
 
 class SpdkWrapper {
    public:
@@ -72,6 +73,11 @@ class SpdkWrapper {
 
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);
+
+    // Query namespace capacity and block size, reusing a connected controller
+    // when available. Connections opened for this query are closed on return.
+    bool QueryNamespaceInfo(const std::string &endpoint, NoFNamespaceInfo &info,
+                            std::string *error_reason = nullptr);
 
     /** @brief Register external memory with SPDK for NoF zero-copy transfers.
      *

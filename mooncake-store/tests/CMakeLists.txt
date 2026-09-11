@@ -164,6 +164,7 @@ if(USE_NOF)
     target_link_options(nof_timeout_delivery_test PRIVATE
                         "-Wl,--wrap=${spdk_entrypoint}")
   endforeach()
+  add_store_test(nof_namespace_query_test nof_namespace_query_test.cpp)
 endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
