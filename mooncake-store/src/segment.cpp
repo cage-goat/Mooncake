@@ -867,7 +867,9 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
 ErrorCode ScopedNoFSegmentAccess::MountSegment(
     const NoFSegment& segment, const UUID& client_id,
     std::shared_ptr<BufferAllocatorBase> restored_allocator,
-    const std::vector<std::unique_ptr<AllocatedBuffer>>& restored_buffers) {
+    const std::vector<std::unique_ptr<AllocatedBuffer>>& restored_buffers,
+    bool* newly_registered) {
+    if (newly_registered) *newly_registered = false;
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
 
@@ -983,6 +985,7 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(
         registration};
     nof_segment_manager_->client_by_name_[segment.name] = client_id;
     MasterMetricManager::instance().inc_total_nof_capacity(segment.name, size);
+    if (newly_registered) *newly_registered = true;
 
     return ErrorCode::OK;
 }
@@ -996,9 +999,14 @@ void ScopedNoFSegmentAccess::QuarantineEndpoint(const std::string& endpoint) {
 }
 
 ErrorCode ScopedNoFSegmentAccess::ReMountSegment(
-    const std::vector<NoFSegment>& segments, const UUID& client_id) {
-    for (const auto& segment : segments) {
+    const std::vector<NoFSegment>& segments, const UUID& client_id,
+    std::vector<size_t>& mounted_indices) {
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const auto& segment = segments[i];
         ErrorCode err = MountSegment(segment, client_id);
+        if (err == ErrorCode::OK) {
+            mounted_indices.push_back(i);
+        }
         if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
             err == ErrorCode::INTERNAL_ERROR) {
             LOG(ERROR) << "NoF segment remount: segment_name=" << segment.name
@@ -1054,7 +1062,7 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
 
 ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
     const UUID& segment_id, const UUID& client_id,
-    const size_t& metrics_dec_capacity) {
+    const size_t& metrics_dec_capacity, std::string& endpoint) {
     bool found_in_client_segments = false;
     auto client_it = nof_segment_manager_->client_segments_.find(client_id);
     if (client_it != nof_segment_manager_->client_segments_.end()) {
@@ -1078,6 +1086,7 @@ ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
     auto segment_it = nof_segment_manager_->mounted_segments_.find(segment_id);
     if (segment_it != nof_segment_manager_->mounted_segments_.end()) {
         segment_name = segment_it->second.segment.name;
+        endpoint = segment_it->second.segment.te_endpoint;
         nof_segment_manager_->client_by_name_.erase(segment_name);
     }
 

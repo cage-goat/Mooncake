@@ -251,7 +251,8 @@ class ScopedNoFSegmentAccess {
         const NoFSegment& segment, const UUID& client_id,
         std::shared_ptr<BufferAllocatorBase> restored_allocator = nullptr,
         const std::vector<std::unique_ptr<AllocatedBuffer>>& restored_buffers =
-            {});
+            {},
+        bool* newly_registered = nullptr);
 
     void QuarantineEndpoint(const std::string& endpoint);
 
@@ -262,7 +263,8 @@ class ScopedNoFSegmentAccess {
      * mounted while the return value will be OK.
      */
     ErrorCode ReMountSegment(const std::vector<NoFSegment>& segments,
-                             const UUID& client_id);
+                             const UUID& client_id,
+                             std::vector<size_t>& mounted_indices);
 
     /**
      * @brief Prepare to unmount a segment by deleting its allocator
@@ -275,7 +277,8 @@ class ScopedNoFSegmentAccess {
      */
     ErrorCode CommitUnmountSegment(const UUID& segment_id,
                                    const UUID& client_id,
-                                   const size_t& metrics_dec_capacity);
+                                   const size_t& metrics_dec_capacity,
+                                   std::string& endpoint);
 
     /**
      * @brief Get all the segments of a client
