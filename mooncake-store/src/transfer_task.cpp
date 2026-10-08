@@ -137,9 +137,8 @@ static void HandleSpdkNofStall(int work_idx, mooncake::nof_seg_handle* seg,
         return;
     }
 
-    const auto now = std::chrono::steady_clock::now();
     SpdkNofStallAction action =
-        mooncake::SpdkNofAdvanceStallState(nof_qos, io_timed_out, now);
+        mooncake::SpdkNofAdvanceStallState(nof_qos, io_timed_out);
     if (action == SpdkNofStallAction::kAbort) {
         LOG(ERROR) << "work " << work_idx << ", seg " << seg
                    << " NoF I/O timed out with inflight_read="
@@ -151,7 +150,7 @@ static void HandleSpdkNofStall(int work_idx, mooncake::nof_seg_handle* seg,
         // SPDK v23.01 that happens before the call returns, so the segment
         // normally drains right here.
         mooncake::SpdkWrapper::GetInstance().AbortNofSegmentIo(seg);
-        action = mooncake::SpdkNofAdvanceStallState(nof_qos, false, now);
+        action = mooncake::SpdkNofAdvanceStallState(nof_qos, false);
     }
     if (action == SpdkNofStallAction::kDrained) {
         const auto drain_ms =

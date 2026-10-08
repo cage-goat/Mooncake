@@ -117,6 +117,9 @@ struct nof_seg_handle {
 
     uint32_t block_size{0};
     bool disconnecting{false};
+    // Worker affinity is per pool; OpenNofSegment() caches handles across
+    // pools and probes. Keep these flags atomic for those shared accesses;
+    // qpair operations themselves still require serialization.
     // Set by NofIoTimeoutCallback() while the qpair is being polled, read
     // back by NvmePollProcessCompletion() on the same thread.
     std::atomic<bool> io_timed_out{false};
