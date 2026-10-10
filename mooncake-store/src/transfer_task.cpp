@@ -80,13 +80,12 @@ static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
 }
 
 static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
-    if (task->remaining_lba == 0 && task->outstanding_sub_io == 0) {
+    if (!task->on_chain && task->remaining_lba == 0 &&
+        task->outstanding_sub_io == 0) {
         task->state->set_completed(task->failed
                                        ? mooncake::ErrorCode::TRANSFER_FAIL
                                        : mooncake::ErrorCode::OK);
-        if (!task->on_chain) {
-            delete task;
-        }
+        delete task;
     }
 }
 
