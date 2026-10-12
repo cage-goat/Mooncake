@@ -333,6 +333,8 @@ SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
     : worker_count_(NoFWorkerPoolConfig::AtFirstUse().worker_count),
       numa_socket_id_(numa_socket_id),
       task_queue_(std::make_unique<std::queue<SpdkNofTask>[]>(worker_count_)),
+      control_queue_(
+          std::make_unique<std::queue<ControlTask>[]>(worker_count_)),
       queue_mutex_(std::make_unique<std::mutex[]>(worker_count_)),
       queue_cv_(std::make_unique<std::condition_variable[]>(worker_count_)),
       shutdown_(false) {
@@ -362,6 +364,14 @@ SpdkNofWorkerPool::~SpdkNofWorkerPool() {
     }
 
     VLOG(1) << "SpdkNofWorkerPool destroyed";
+}
+
+void SpdkNofWorkerPool::PostControlTask(int worker_idx, ControlTask task) {
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_[worker_idx]);
+        control_queue_[worker_idx].push(std::move(task));
+    }
+    queue_cv_[worker_idx].notify_one();
 }
 
 void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
@@ -441,19 +451,33 @@ static inline bool CheckSubTaskPool(
     return true;
 }
 
+struct SpdkNofWorkerPool::WorkerContext {
+    int64_t total_outstanding_io{0};
+    std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
+    std::stack<SpdkNofSubTask*> sub_task_pool;
+    std::vector<SpdkNofSubTask*> sub_task_chunks;
+    std::chrono::steady_clock::time_point last_debug_snapshot{
+        std::chrono::steady_clock::now()};
+
+    ~WorkerContext() {
+        for (auto* sub_tasks : sub_task_chunks) delete[] sub_tasks;
+    }
+};
+
 void SpdkNofWorkerPool::workerThread(int work_idx) {
     bindToSocket(numa_socket_id_);
     VLOG(2) << "SpdkNofWorkerPool worker thread started";
 
-    int64_t total_outstanding_io = 0;
-    // std::set<nof_seg_handle *> seg_set;
-    std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
-    std::stack<SpdkNofSubTask*> sub_task_pool;
-    std::vector<SpdkNofSubTask*> sub_task_chunks;
+    WorkerContext ctx;
+    auto& total_outstanding_io = ctx.total_outstanding_io;
+    auto& seg_to_qos = ctx.seg_to_qos;
+    auto& sub_task_pool = ctx.sub_task_pool;
+    auto& sub_task_chunks = ctx.sub_task_chunks;
     auto& task_queue = task_queue_[work_idx];
+    auto& control_queue = control_queue_[work_idx];
     auto& queue_cv = queue_cv_[work_idx];
     auto& queue_mutex = queue_mutex_[work_idx];
-    auto last_debug_snapshot = std::chrono::steady_clock::now();
+    auto& last_debug_snapshot = ctx.last_debug_snapshot;
 
     if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx)) {
         return;
@@ -463,15 +487,28 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         // Wait for task or shutdown signal
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            queue_cv.wait(
-                lock, [this, &task_queue, &total_outstanding_io, &seg_to_qos] {
-                    return shutdown_.load() || !task_queue.empty() ||
-                           total_outstanding_io || HasBufferedTask(seg_to_qos);
-                });
+            queue_cv.wait(lock, [this, &task_queue, &control_queue,
+                                 &total_outstanding_io, &seg_to_qos] {
+                return shutdown_.load() || !task_queue.empty() ||
+                       !control_queue.empty() || total_outstanding_io ||
+                       HasBufferedTask(seg_to_qos);
+            });
 
             if (shutdown_.load() && task_queue.empty() &&
-                (total_outstanding_io == 0) && !HasBufferedTask(seg_to_qos)) {
+                control_queue.empty() && (total_outstanding_io == 0) &&
+                !HasBufferedTask(seg_to_qos)) {
                 break;
+            }
+
+            if (!control_queue.empty()) {
+                std::queue<ControlTask> controls;
+                controls.swap(control_queue);
+                lock.unlock();
+                while (!controls.empty()) {
+                    controls.front()(ctx);
+                    controls.pop();
+                }
+                lock.lock();
             }
 
             while (!task_queue.empty()) {
@@ -609,12 +646,6 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             }
         }
     }
-
-    for (auto* sub_tasks : sub_task_chunks) {
-        delete[] sub_tasks;
-    }
-    // seg_to_qos will automatically clean up SpdkNofQos objects using
-    // unique_ptr
 
     VLOG(2) << "SpdkNofWorkerPool worker thread exiting";
 }
