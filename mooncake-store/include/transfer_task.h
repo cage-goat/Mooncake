@@ -407,6 +407,7 @@ class MemcpyWorkerPool {
 #ifdef USE_NOF
 // struct SpdkNofSubTask;
 struct SpdkNofQos;
+struct SpdkNofControllerState;
 
 /**
  * @brief Spdk nvmf operation descriptor
@@ -454,6 +455,8 @@ struct SpdkNofSubTask {
 constexpr int kDefaultSpdkNofSubmitChunkBytes = (1 << 17);    // 128k
 constexpr int kDefaultSpdkNofInflightBytesLimit = (1 << 25);  // 32M
 struct SpdkNofQos {
+    SpdkNofControllerState* controller_state{nullptr};
+
     int inflight_blocks[kSpdkNofOpNum];
     int blocks_per_chunk;
     int inflight_blocks_limit;
@@ -483,6 +486,13 @@ struct SpdkNofQos {
             head[op] = head[op]->nxt;
         }
     }
+};
+
+struct SpdkNofControllerState {
+    enum class Phase { Running, Cleaning, Paused };
+
+    Phase phase{Phase::Running};
+    std::vector<nof_seg_handle*> draining_segments;
 };
 
 /**
@@ -518,6 +528,7 @@ class SpdkNofWorkerPool {
 
    private:
     void workerThread(int work_idx);
+    void PostRecoveryTask(int worker_idx, ctrlr_info* ctrlr, bool resume);
 
     int worker_count_;
     int numa_socket_id_;

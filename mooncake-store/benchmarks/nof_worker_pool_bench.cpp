@@ -736,7 +736,8 @@ int main(int argc, char **argv) {
         std::unordered_set<mooncake::nof_seg_handle *> unique_handles;
         for (size_t i = 0; i < endpoint_strings.size(); ++i) {
             EndpointContext endpoint(endpoint_strings[i], FLAGS_seed + i);
-            endpoint.seg_handle = wrapper.OpenNofSegment(endpoint.endpoint);
+            endpoint.seg_handle =
+                wrapper.OpenNofSegment(endpoint.endpoint, true);
             if (!endpoint.seg_handle) {
                 LOG(ERROR) << "Failed to open NoF endpoint: "
                            << endpoint.endpoint;
