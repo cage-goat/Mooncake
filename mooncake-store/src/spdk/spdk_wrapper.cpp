@@ -243,8 +243,19 @@ void SpdkWrapper::Cleanup() {
                             spdk_nvme_ctrlr_free_io_qpair(seg->qpair);
                         }
                     }
-                    // Detach controller
+                    // All client owners have exited and the controller thread
+                    // has joined. Close the admin connection locally before
+                    // detach, whose register reads otherwise wait indefinitely
+                    // for a target that is still alive but not responding.
                     if (info->ctrlr) {
+                        if (info->recovery_enabled) {
+                            spdk_nvme_ctrlr_disconnect(info->ctrlr);
+                            while (spdk_nvme_ctrlr_process_admin_completions(
+                                       info->ctrlr) != -ENXIO) {
+                                std::this_thread::sleep_for(
+                                    std::chrono::milliseconds(1));
+                            }
+                        }
                         spdk_nvme_detach(info->ctrlr);
                     }
                 }
