@@ -24,7 +24,7 @@ nof_target_start() {
     kill -0 "$TARGET_PID" 2>/dev/null && (( SECONDS < deadline )) || return 1
     sleep 0.1
   done
-  nof_target_rpc nvmf_create_transport -t TCP >"$NOF_TARGET_SETUP_LOG" || return
+  nof_target_rpc nvmf_create_transport -t "${TARGET_TRANSPORT:-TCP}" >"$NOF_TARGET_SETUP_LOG" || return
   nof_target_rpc nvmf_create_subsystem "$TARGET_NQN" -a -s MC_NOF_E2E \
     >>"$NOF_TARGET_SETUP_LOG"
 }
@@ -38,7 +38,7 @@ nof_target_add_malloc_ns() {
 }
 
 nof_target_start_listener() {
-  nof_target_rpc nvmf_subsystem_add_listener "$TARGET_NQN" -t TCP \
+  nof_target_rpc nvmf_subsystem_add_listener "$TARGET_NQN" -t "${TARGET_TRANSPORT:-TCP}" \
     -a "$TARGET_HOST" -s "$TARGET_PORT" >>"$NOF_TARGET_SETUP_LOG"
 }
 

@@ -106,3 +106,13 @@ if(USE_NOF)
     nof_controller_recovery_e2e PRIVATE mooncake_store gflags::gflags
                                         glog::glog pthread)
 endif()
+
+# Run through run_nof_stalled_io_tcp_e2e.sh or the topology/fault matrix.
+if(USE_NOF)
+  add_executable(nof_stale_io_recovery_e2e nof_stale_io_recovery_e2e.cpp)
+  target_include_directories(nof_stale_io_recovery_e2e
+                             PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+  target_link_libraries(
+    nof_stale_io_recovery_e2e PRIVATE mooncake_store gflags::gflags glog::glog
+                                      pthread)
+endif()

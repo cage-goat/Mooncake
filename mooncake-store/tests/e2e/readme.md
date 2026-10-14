@@ -14,6 +14,7 @@ The E2E test suite includes several executable programs designed to test differe
 - **store_client_e2e.py**: Python `MooncakeDistributedStore` client that continuously issues `put/get` operations.
 - **run_nof_heartbeat_tcp_e2e.sh**: Scripted NoF heartbeat end-to-end test using a TCP SPDK target.
 - **run_nof_controller_recovery_tcp_e2e.sh**: Verifies controller reset and I/O qpair reconnection across two workers after a TCP target restart.
+- **run_nof_stale_io_recovery_matrix.sh**: Tests stalled I/O, repeated controller recovery, and pool shutdown across namespaces/workers/pools using TCP or RDMA.
 
 ## Parameters
 
@@ -123,6 +124,48 @@ PRE_FAULT_SUCCESS_TARGET=10 BUILD_DIR=/path/to/build ./run_nof_heartbeat_tcp_e2e
 - In default mode, the script verifies **service continuity** after NoF unmount by checking that post-fault I/O still succeeds.
 - In `CLIENT_GLOBAL_SEGMENT_SIZE=0` mode, the script verifies **NoF-only failure behavior** by checking that post-fault I/O starts failing after the NoF segment is removed.
 - Logs are written under `LOG_DIR` (default `/tmp/mooncake_nof_heartbeat_e2e`) and the final pass/fail summary is printed from `summary.log`.
+
+### run_nof_stalled_io_tcp_e2e.sh / run_nof_stale_io_recovery_matrix.sh
+
+Build with `USE_NOF=ON`, `BUILD_UNIT_TESTS=ON` and assertions enabled. The runners
+require an existing SPDK build and sufficient hugepage access; they do not change
+host hugepage settings or stop processes outside their own test. Each run uses a
+fresh log directory, unique RPC socket/NQN and an automatically selected TCP port.
+
+```bash
+cmake --build build --parallel 12 --target nof_task_lifecycle_test \
+  nof_timeout_delivery_test nof_worker_control_queue_test nof_stale_io_recovery_e2e
+ctest --test-dir build --output-on-failure \
+  -R '^(nof_task_lifecycle_test|nof_timeout_delivery_test|nof_worker_control_queue_test)$'
+BUILD_DIR="$PWD/build" SPDK_DIR=/path/to/spdk \
+  bash mooncake-store/tests/e2e/run_nof_stale_io_recovery_matrix.sh
+# Optional real RDMA transport; use a local address backed by an RDMA NIC.
+TARGET_TRANSPORT=RDMA TARGET_HOST=10.0.130.56 \
+  BUILD_DIR="$PWD/build" SPDK_DIR=/path/to/spdk \
+  bash mooncake-store/tests/e2e/run_nof_stale_io_recovery_matrix.sh
+```
+
+The matrix covers four namespaces (512/4096-byte blocks), one/two workers and
+one/two pools sharing a controller. Each fault has 12 concurrent requests, with
+both read/write QoS queues, partial submissions and queued work. `SIGSTOP` leaves
+the target process and transport alive; normal fault cases must fail all requests
+while the target remains stopped, then reuse the original handles for verified
+writes/reads after `SIGCONT` or restart. Buffer canaries check for late writes
+after completion. Logs are checked for timeout/recovery ordering, qpair recreation,
+exactly one controller recovery per fault and final zero queue/inflight counters.
+
+Modes include repeated `resume`/`restart`, `disabled` (timeout zero), `short`
+(pause below timeout), and `shutdown`/`pool_exit` before timeout. Their
+`shutdown_recovery`/`pool_exit_recovery` variants destroy pools after an observed
+controller reconnect retry; the surviving pool must still recover. Process exit
+is bounded as well as individual I/O. The matrix runs 18 fault cycles per transport.
+
+For one case, run `run_nof_stalled_io_tcp_e2e.sh` with `MODE`, `CYCLES`, `POOLS`,
+`WORKERS`, `IO_TIMEOUT_MS`, `LOG_DIR` and `TIMEOUT_SEC` as needed. The matrix uses
+`LOG_ROOT` and keeps separate client/target logs per case. Failed requests are not
+replayed, and malloc-bdev data is rewritten after a target restart. These tests
+exercise the production Store worker/SPDK path directly; Master heartbeat and
+Store RPC/metadata policies are outside this test's scope.
 
 ### run_nof_controller_recovery_tcp_e2e.sh
 
