@@ -1,6 +1,6 @@
 // The SPDK entry points below are a sequential TEST DOUBLE, not a real-SPDK
 // E2E transport. GNU ld --wrap keeps the actual SpdkWrapper implementation,
-// including its registered timeout callback and polling/abort paths, in use.
+// including its registered timeout callback and polling/drain paths, in use.
 // These tests establish timeout delivery; they do not establish cross-pool
 // qpair serialization or ownership of another worker's counters/free list.
 #include "spdk/spdk_wrapper.h"
@@ -39,6 +39,9 @@ struct TransportDouble {
     int submissions = 0;
     int timeout_callbacks = 0;
     int disconnects = 0;
+    int frees = 0;
+    bool disconnecting = false;
+    bool complete_disconnect = false;
 } transport;
 
 int AcceptRequest(spdk_nvme_ns* ns, spdk_nvme_qpair* qpair,
@@ -98,6 +101,34 @@ TEST(NofTimeoutConfigurationDeathTest, RejectsWhitespacePrefixedNegativeValue) {
         ::testing::ExitedWithCode(0), "Invalid value for MC_NOF_IO_TIMEOUT_MS");
 }
 
+TEST(NofTimeoutConfigurationDeathTest, ZeroDisablesTimeout) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            setenv(kTimeoutEnv, "0", 1);
+            auto* seg =
+                mooncake::SpdkWrapper::GetInstance().OpenNofSegment(kEndpoint);
+            std::exit(seg != nullptr && transport.timeout_callback == nullptr
+                          ? 0
+                          : 1);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST(NofTimeoutConfigurationDeathTest, CapsLargeTimeout) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            setenv(kTimeoutEnv, "3600001", 1);
+            auto* seg =
+                mooncake::SpdkWrapper::GetInstance().OpenNofSegment(kEndpoint);
+            std::exit(seg != nullptr && transport.timeout_us == 3600000000ULL
+                          ? 0
+                          : 1);
+        },
+        ::testing::ExitedWithCode(0), "exceeds the maximum");
+}
+
 class NofTimeoutDeliveryTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -118,7 +149,10 @@ class NofTimeoutDeliveryTest : public ::testing::Test {
     void TearDown() override {
         // Retain the callback context and caller buffer until local abort has
         // delivered the outstanding request's completion, including on failure.
-        if (seg_ && transport.outstanding) wrapper_.AbortNofSegmentIo(seg_);
+        if (seg_) {
+            transport.complete_disconnect = true;
+            EXPECT_TRUE(wrapper_.DrainClientQpair(seg_));
+        }
         wrapper_.Cleanup();
         if (saved_env_) {
             setenv(kTimeoutEnv, saved_env_->c_str(), 1);
@@ -175,21 +209,37 @@ TEST_F(NofTimeoutDeliveryTest, PendingTimeoutSurvivesInterveningNullPoll) {
     ExpectOneOutstandingTimeout();
 }
 
-TEST_F(NofTimeoutDeliveryTest, OwnerAbortRetainsContextUntilCompletion) {
+TEST_F(NofTimeoutDeliveryTest, AsyncDrainRetainsContextUntilCompletion) {
     bool timed_out = false;
     EXPECT_EQ(wrapper_.NvmePollProcessCompletion(seg_, 0, &timed_out), 0);
     ASSERT_TRUE(timed_out);
     ExpectOneOutstandingTimeout();
-    wrapper_.AbortNofSegmentIo(seg_);
+    EXPECT_FALSE(wrapper_.DrainClientQpair(seg_));
     EXPECT_EQ(transport.disconnects, 1);
+    EXPECT_TRUE(transport.outstanding);
+    EXPECT_EQ(completion_.calls, 0);
+    EXPECT_EQ(transport.frees, 0);
+    EXPECT_FALSE(wrapper_.DrainClientQpair(seg_));
+    EXPECT_EQ(transport.disconnects, 1);
+    transport.complete_disconnect = true;
+    EXPECT_TRUE(wrapper_.DrainClientQpair(seg_));
+    EXPECT_EQ(transport.frees, 1);
     EXPECT_FALSE(transport.outstanding);
     EXPECT_EQ(completion_.calls, 1);
     EXPECT_TRUE(completion_.aborted);
-    EXPECT_EQ(
-        wrapper_.SubmitRequest(seg_, buffer_, 0, 1, mooncake::kSpdkNofOpWrite,
-                               RecordCompletion, &completion_),
-        -ENXIO);
-    EXPECT_EQ(transport.submissions, 1);
+    EXPECT_TRUE(wrapper_.DrainClientQpair(seg_));
+    EXPECT_EQ(transport.frees, 1);
+    EXPECT_EQ(completion_.calls, 1);
+}
+
+TEST_F(NofTimeoutDeliveryTest, DrainDiscardsOldQpairTimeout) {
+    EXPECT_EQ(wrapper_.NvmePollProcessCompletion(seg_, 0), 0);
+    ExpectOneOutstandingTimeout();
+    transport.complete_disconnect = true;
+    ASSERT_TRUE(wrapper_.DrainClientQpair(seg_));
+    bool timed_out = true;
+    EXPECT_EQ(wrapper_.NvmePollProcessCompletion(seg_, 0, &timed_out), 0);
+    EXPECT_FALSE(timed_out);
     EXPECT_EQ(completion_.calls, 1);
 }
 
@@ -230,9 +280,11 @@ spdk_nvme_qpair* __wrap_spdk_nvme_ctrlr_alloc_io_qpair(
 }
 int __wrap_spdk_nvme_ctrlr_free_io_qpair(spdk_nvme_qpair*) {
     EXPECT_FALSE(transport.outstanding);
+    ++transport.frees;
     return 0;
 }
 int __wrap_spdk_nvme_detach(spdk_nvme_ctrlr*) { return 0; }
+uint32_t __wrap_spdk_nvme_ns_get_sector_size(spdk_nvme_ns*) { return 4096; }
 
 int __wrap_spdk_nvme_ns_cmd_write(spdk_nvme_ns* ns, spdk_nvme_qpair* qpair,
                                   void*, uint64_t, uint32_t,
@@ -250,6 +302,18 @@ int __wrap_spdk_nvme_ns_cmd_read(spdk_nvme_ns* ns, spdk_nvme_qpair* qpair,
 int32_t __wrap_spdk_nvme_qpair_process_completions(spdk_nvme_qpair* qpair,
                                                    uint32_t) {
     EXPECT_EQ(qpair, OpaqueIdentity<spdk_nvme_qpair>());
+    if (transport.disconnecting) {
+        if (!transport.complete_disconnect) return 0;
+        if (transport.outstanding) {
+            transport.outstanding = false;
+            spdk_nvme_cpl completion = {};
+            completion.status.sct = SPDK_NVME_SCT_GENERIC;
+            completion.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;
+            transport.completion_callback(transport.completion_arg,
+                                          &completion);
+        }
+        return -ENXIO;
+    }
     if (transport.inject_timeout && transport.outstanding &&
         !transport.timeout_reported) {
         transport.timeout_reported = true;
@@ -263,13 +327,7 @@ int32_t __wrap_spdk_nvme_qpair_process_completions(spdk_nvme_qpair* qpair,
 void __wrap_spdk_nvme_ctrlr_disconnect_io_qpair(spdk_nvme_qpair* qpair) {
     EXPECT_EQ(qpair, OpaqueIdentity<spdk_nvme_qpair>());
     ++transport.disconnects;
-    if (transport.outstanding) {
-        transport.outstanding = false;
-        spdk_nvme_cpl completion = {};
-        completion.status.sct = SPDK_NVME_SCT_GENERIC;
-        completion.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;
-        transport.completion_callback(transport.completion_arg, &completion);
-    }
+    transport.disconnecting = true;
 }
 
 }  // extern "C"

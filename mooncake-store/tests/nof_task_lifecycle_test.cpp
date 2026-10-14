@@ -1,19 +1,10 @@
-// Lifecycle invariants of SPDK NoF tasks and sub-I/Os around a stalled qpair
-// (kvcache-ai/Mooncake#3864). Exercises the transport-independent helpers in
-// transfer_task.h the way SpdkNofWorkerPool::workerThread() and the SPDK
-// completion callback use them, without SPDK or a target:
-//
-//  * the caller of a task is completed exactly once;
-//  * a SpdkNofSubTask slot goes back to the pool only through its completion;
-//  * QoS, per-task and per-worker accounting return to baseline;
-//  * the segment leaves kDraining only once every outstanding sub-I/O has
-//    completed, whether it completed normally or was aborted.
+// Exercise the production task/accounting helpers used by normal callbacks
+// and controller cleanup. Real worker/transport ordering is covered by E2E.
 #include "transfer_task.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <chrono>
 #include <memory>
 #include <stack>
 #include <vector>
@@ -82,16 +73,11 @@ class NofTaskLifecycleTest : public ::testing::Test {
         SpdkNofTaskCompletion(task);
     }
 
-    SpdkNofStallAction Advance(bool io_timed_out) {
-        return SpdkNofAdvanceStallState(*qos_, io_timed_out);
-    }
-
     void ExpectBaseline() {
         EXPECT_EQ(pool_.size(), static_cast<size_t>(kSlotCount));
         EXPECT_EQ(qos_->InflightBlocks(), 0);
         EXPECT_EQ(total_outstanding_io_, 0);
         EXPECT_TRUE(qos_->Empty());
-        EXPECT_EQ(qos_->state, SpdkNofSegmentState::kActive);
     }
 
     alignas(kBlockSize) char buffer_[kBlockSize];
@@ -117,8 +103,6 @@ TEST_F(NofTaskLifecycleTest, NormalCompletion) {
     SpdkNofCompleteSubTask(second, /*failed=*/false);
     ASSERT_TRUE(state->is_completed());
     EXPECT_EQ(state->get_result(), ErrorCode::OK);
-    EXPECT_EQ(Advance(false), SpdkNofStallAction::kNone);
-    EXPECT_EQ(qos_->drain_started, std::chrono::steady_clock::time_point{});
     ExpectBaseline();
 }
 
@@ -127,19 +111,15 @@ TEST_F(NofTaskLifecycleTest, ErrorOnPartiallySubmittedTaskCompletesCallerOnce) {
     SpdkNofTask* task = Enqueue(/*lba_count=*/3, kSpdkNofOpRead, &state);
     SpdkNofSubTask* sub_task = Submit(task, 1);
 
-    // The callback fails the task while it is still on the chain with LBAs
-    // left to submit: the caller is told now, the task itself must survive
-    // until the submit loop takes it off the chain.
+    // An error callback may run while this partially submitted task is
+    // still linked. Do not publish completion until the worker unlinks it.
     SpdkNofCompleteSubTask(sub_task, /*failed=*/true);
-    ASSERT_TRUE(state->is_completed());
-    EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
-    EXPECT_TRUE(task->completed);
+    EXPECT_FALSE(state->is_completed());
     EXPECT_TRUE(task->on_chain);
     EXPECT_EQ(task->remaining_lba, 0);
 
-    // Second SpdkNofTaskCompletion() from the submit loop: no second
-    // set_completed() (that asserts in debug builds), the task is freed.
     PopFromChain(task);
+    ASSERT_TRUE(state->is_completed());
     EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
     ExpectBaseline();
 }
@@ -163,130 +143,67 @@ TEST_F(NofTaskLifecycleTest, SlotIsReturnedOnlyByCompletion) {
     EXPECT_EQ(sub_task->task, nullptr);
 }
 
-TEST_F(NofTaskLifecycleTest, TimeoutAbortsAndDrainsBeforeCallerIsFailed) {
+// Controller cleanup first unlinks queued work, then polls asynchronous
+// disconnect until every accepted request has called back.
+TEST_F(NofTaskLifecycleTest, CleanupWaitsForEveryAcceptedSubIo) {
     std::shared_ptr<SpdkNofOperationState> state;
-    SpdkNofTask* task = Enqueue(/*lba_count=*/4, kSpdkNofOpWrite, &state);
-    SpdkNofSubTask* first = Submit(task, 1);
-    SpdkNofSubTask* second = Submit(task, 1);
-    // 2 LBAs not yet submitted, 2 sub-I/Os outstanding on the stalled qpair.
-
-    ASSERT_EQ(Advance(/*io_timed_out=*/true), SpdkNofStallAction::kAbort);
-    EXPECT_EQ(qos_->state, SpdkNofSegmentState::kDraining);
-    // Nothing has completed yet, so the caller cannot be told anything and
-    // the drain is not over.
+    auto* task = Enqueue(4, kSpdkNofOpWrite, &state);
+    auto* first = Submit(task, 1);
+    auto* second = Submit(task, 1);
+    task->failed = true;
+    task->remaining_lba = 0;
+    PopFromChain(task);
     EXPECT_FALSE(state->is_completed());
-    EXPECT_EQ(Advance(false), SpdkNofStallAction::kNone);
-    EXPECT_EQ(qos_->state, SpdkNofSegmentState::kDraining);
-
-    // The local abort completes the outstanding requests as aborted. The
-    // first one fails the task (remaining LBAs are dropped) but the caller
-    // still cannot be told: the second sub-I/O may still be referenced by
-    // SPDK, and with it the caller's buffer.
-    SpdkNofCompleteSubTask(first, /*failed=*/true);
-    EXPECT_EQ(qos_->drained_sub_io, 1);
-    EXPECT_EQ(task->remaining_lba, 0);
-    EXPECT_TRUE(task->failed);
+    SpdkNofCompleteSubTask(first, true);
     EXPECT_FALSE(state->is_completed());
-    EXPECT_EQ(qos_->InflightBlocks(), 1);
-    EXPECT_EQ(Advance(false), SpdkNofStallAction::kNone);
-
-    SpdkNofCompleteSubTask(second, /*failed=*/true);
-    EXPECT_EQ(qos_->drained_sub_io, 2);
+    EXPECT_EQ(total_outstanding_io_, 1);
+    SpdkNofCompleteSubTask(second, true);
     ASSERT_TRUE(state->is_completed());
     EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
-    EXPECT_EQ(Advance(false), SpdkNofStallAction::kDrained);
-    EXPECT_EQ(qos_->state, SpdkNofSegmentState::kActive);
-
-    PopFromChain(task);
     ExpectBaseline();
 }
 
-TEST_F(NofTaskLifecycleTest, PartialCompletionAtTimeoutFailsCallerOnce) {
+TEST_F(NofTaskLifecycleTest, CompletedChunksDoNotMaskAnAbortedChunk) {
     std::shared_ptr<SpdkNofOperationState> state;
-    SpdkNofTask* task = Enqueue(/*lba_count=*/3, kSpdkNofOpRead, &state);
-    SpdkNofSubTask* done = Submit(task, 1);
-    SpdkNofSubTask* stuck_a = Submit(task, 1);
-    SpdkNofSubTask* stuck_b = Submit(task, 1);
+    auto* task = Enqueue(3, kSpdkNofOpRead, &state);
+    auto* first = Submit(task, 1);
+    auto* second = Submit(task, 1);
+    auto* third = Submit(task, 1);
     PopFromChain(task);
-    SpdkNofCompleteSubTask(done, /*failed=*/false);
+    SpdkNofCompleteSubTask(first, false);
+    SpdkNofCompleteSubTask(second, true);
     EXPECT_FALSE(state->is_completed());
-
-    ASSERT_EQ(Advance(true), SpdkNofStallAction::kAbort);
-    SpdkNofCompleteSubTask(stuck_a, /*failed=*/true);
-    ASSERT_FALSE(state->is_completed());
-    SpdkNofCompleteSubTask(stuck_b, /*failed=*/true);
+    SpdkNofCompleteSubTask(third, false);
     ASSERT_TRUE(state->is_completed());
     EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
-    EXPECT_EQ(Advance(false), SpdkNofStallAction::kDrained);
     ExpectBaseline();
 }
 
-TEST_F(NofTaskLifecycleTest, SeveralTasksTimedOutTogether) {
-    constexpr int kTasks = 3;
-    std::shared_ptr<SpdkNofOperationState> states[kTasks];
-    SpdkNofTask* tasks[kTasks];
-    SpdkNofSubTask* sub_tasks[kTasks];
-    for (int i = 0; i < kTasks; ++i) {
-        tasks[i] = Enqueue(/*lba_count=*/2, kSpdkNofOpWrite, &states[i]);
-    }
-    for (int i = 0; i < kTasks; ++i) {
-        sub_tasks[i] = Submit(tasks[i], 1);  // one chunk each still queued
-    }
-    ASSERT_EQ(Advance(true), SpdkNofStallAction::kAbort);
-    for (int i = 0; i < kTasks; ++i) {
-        SpdkNofCompleteSubTask(sub_tasks[i], /*failed=*/true);
-    }
-    EXPECT_EQ(Advance(false), SpdkNofStallAction::kDrained);
-    for (int i = 0; i < kTasks; ++i) {
-        ASSERT_TRUE(states[i]->is_completed());
-        EXPECT_EQ(states[i]->get_result(), ErrorCode::TRANSFER_FAIL);
-        PopFromChain(tasks[i]);
-    }
-    ExpectBaseline();
-}
-
-TEST_F(NofTaskLifecycleTest, RepeatedTimeoutReportWhileDrainingIsIgnored) {
+TEST_F(NofTaskLifecycleTest, CleanupFailsQueuedWorkWithoutCallbacks) {
     std::shared_ptr<SpdkNofOperationState> state;
-    SpdkNofTask* task = Enqueue(/*lba_count=*/1, kSpdkNofOpWrite, &state);
-    SpdkNofSubTask* sub_task = Submit(task, 1);
+    auto* task = Enqueue(4, kSpdkNofOpWrite, &state);
+    task->remaining_lba = 0;
+    task->failed = true;
     PopFromChain(task);
-
-    const auto before_drain = std::chrono::steady_clock::now();
-    ASSERT_EQ(Advance(true), SpdkNofStallAction::kAbort);
-    const auto drain_started = qos_->drain_started;
-    EXPECT_GE(drain_started, before_drain);
-    EXPECT_LE(drain_started, std::chrono::steady_clock::now());
-    // e.g. a reset issued by another path, or SPDK reporting the next
-    // request of the same qpair, must not restart the drain.
-    EXPECT_EQ(Advance(true), SpdkNofStallAction::kNone);
-    EXPECT_EQ(qos_->drain_started, drain_started);
-    EXPECT_EQ(qos_->state, SpdkNofSegmentState::kDraining);
-    EXPECT_EQ(qos_->drained_sub_io, 0);
-
-    SpdkNofCompleteSubTask(sub_task, /*failed=*/true);
-    EXPECT_EQ(Advance(true), SpdkNofStallAction::kDrained);
+    ASSERT_TRUE(state->is_completed());
+    EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
     ExpectBaseline();
 }
 
-TEST_F(NofTaskLifecycleTest, HealthyIoAfterDrain) {
-    std::shared_ptr<SpdkNofOperationState> stalled_state;
-    SpdkNofTask* stalled =
-        Enqueue(/*lba_count=*/1, kSpdkNofOpRead, &stalled_state);
-    SpdkNofSubTask* stalled_sub = Submit(stalled, 1);
-    PopFromChain(stalled);
-    ASSERT_EQ(Advance(true), SpdkNofStallAction::kAbort);
-    SpdkNofCompleteSubTask(stalled_sub, /*failed=*/true);
-    ASSERT_EQ(Advance(false), SpdkNofStallAction::kDrained);
-    EXPECT_EQ(stalled_state->get_result(), ErrorCode::TRANSFER_FAIL);
-
-    std::shared_ptr<SpdkNofOperationState> state;
-    SpdkNofTask* task = Enqueue(/*lba_count=*/1, kSpdkNofOpRead, &state);
-    SpdkNofSubTask* sub_task = Submit(task, 1);
-    PopFromChain(task);
-    SpdkNofCompleteSubTask(sub_task, /*failed=*/false);
-    EXPECT_EQ(state->get_result(), ErrorCode::OK);
-    EXPECT_EQ(Advance(false), SpdkNofStallAction::kNone);
-    ExpectBaseline();
+TEST_F(NofTaskLifecycleTest, RecoveredIoReusesReclaimedSlots) {
+    for (int cycle = 0; cycle < 20; ++cycle) {
+        for (bool failed : {true, false}) {
+            std::shared_ptr<SpdkNofOperationState> state;
+            auto* task = Enqueue(1, kSpdkNofOpRead, &state);
+            auto* sub = Submit(task, 1);
+            PopFromChain(task);
+            SpdkNofCompleteSubTask(sub, failed);
+            ASSERT_TRUE(state->is_completed());
+            EXPECT_EQ(state->get_result(),
+                      failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK);
+            ExpectBaseline();
+        }
+    }
 }
 
 }  // namespace

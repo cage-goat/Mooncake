@@ -143,6 +143,10 @@ if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
   add_store_test(nof_task_lifecycle_test nof_task_lifecycle_test.cpp)
   add_store_test(nof_timeout_delivery_test nof_timeout_delivery_test.cpp)
+  foreach(nof_test IN ITEMS nof_task_lifecycle_test nof_timeout_delivery_test)
+    target_include_directories(${nof_test} PRIVATE ${SPDK_INCLUDE_DIR}
+                                                   ${DPDK_INCLUDE_DIR})
+  endforeach()
   # Only this executable replaces SPDK hardware calls with a transport test
   # double.
   foreach(
@@ -153,6 +157,7 @@ if(USE_NOF)
           spdk_nvme_ctrlr_register_timeout_callback
           spdk_nvme_ctrlr_is_active_ns
           spdk_nvme_ctrlr_get_ns
+          spdk_nvme_ns_get_sector_size
           spdk_nvme_ctrlr_alloc_io_qpair
           spdk_nvme_ctrlr_free_io_qpair
           spdk_nvme_detach
