@@ -520,6 +520,10 @@ class SpdkNofWorkerPool {
     SpdkNofWorkerPool(SpdkNofWorkerPool&&) = delete;
     SpdkNofWorkerPool& operator=(SpdkNofWorkerPool&&) = delete;
 
+    // Bind the segment to a worker before returning. That worker creates the
+    // qpair and starts the asynchronous connection.
+    nof_seg_handle* OpenNofSegment(const std::string& tr_str);
+
     /**
      * @brief Submit a spdk nvmf task for async execution
      * @param task The spdk nvmf task to execute

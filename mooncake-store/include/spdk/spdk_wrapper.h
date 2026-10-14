@@ -46,7 +46,8 @@ class SpdkWrapper {
     int64_t NvmePollProcessCompletion(nof_seg_handle *seg,
                                       uint32_t complete_per_seg);
 
-    /** @brief Open a NoF segment. */
+    // When recovery_enabled is true, only prepare the segment metadata;
+    // the owner worker creates the qpair.
     nof_seg_handle *OpenNofSegment(const std::string &tr_str,
                                    bool recovery_enabled = false);
 
@@ -117,8 +118,8 @@ class SpdkWrapper {
     void StartControllerThread();
 
     ctrlr_info *GetController(const nof_seg_handle *seg) const;
-    bool AdmitClientRequest(nof_seg_handle *seg, WorkerId owner,
-                            const std::function<void()> &enqueue);
+    bool BindSegmentToWorker(nof_seg_handle *seg, WorkerId owner,
+                             const std::function<void()> &enqueue);
 
     void RequestRecovery(ctrlr_info *ctrlr);
     std::vector<nof_seg_handle *> OwnedSegments(ctrlr_info *ctrlr,

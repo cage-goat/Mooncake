@@ -465,21 +465,14 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str,
             return nullptr;
         }
 
-        // TODO: For recoverable clients, bind the owner before creating the
-        // qpair and create it on that worker. Publish worker-local ownership
-        // before recovery or shutdown can request cleanup.
-        spdk_nvme_io_qpair_opts opts;
-        spdk_nvme_ctrlr_get_default_io_qpair_opts(info->ctrlr, &opts,
-                                                  sizeof(opts));
-        opts.async_mode = recovery_enabled;
-        qpair =
-            spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, &opts, sizeof(opts));
-        if (!qpair) {
-            LOG(ERROR) << "alloc spdk_nvme_qpair failed";
-            return nullptr;
-        }
-
         auto new_seg = std::make_unique<nof_seg_handle>();
+        if (!recovery_enabled) {
+            qpair = spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
+            if (!qpair) {
+                LOG(ERROR) << "alloc spdk_nvme_qpair failed";
+                return nullptr;
+            }
+        }
         new_seg->qpair = qpair;
         new_seg->ns = ns;
         new_seg->controller = info;
@@ -632,23 +625,24 @@ ctrlr_info *SpdkWrapper::GetController(const nof_seg_handle *seg) const {
     return seg->controller;
 }
 
-bool SpdkWrapper::AdmitClientRequest(nof_seg_handle *seg, WorkerId owner,
-                                     const std::function<void()> &enqueue) {
+bool SpdkWrapper::BindSegmentToWorker(nof_seg_handle *seg, WorkerId owner,
+                                      const std::function<void()> &enqueue) {
     auto *info = seg->controller;
 
-    // TODO: Separate initial binding from request admission. Once ownership
-    // is established, enqueue directly and reuse the worker-local phase check
-    // instead of taking ns_mutex per request. Also cache handles at the caller
-    // to avoid reacquiring controller locks through OpenNofSegment each time.
     std::lock_guard<std::mutex> lock(info->ns_mutex);
     if (!info->recovery_enabled || info->state != ctrlr_info::State::Ready ||
-        !seg->ns || (seg->owner.first && seg->owner != owner))
+        !seg->ns || seg->owner.first)
         return false;
 
-    // Publish ownership and enqueue under the same recovery admission lock.
+    bool owner_added = info->owners.insert(owner).second;
     seg->owner = owner;
-    info->owners.insert(owner);
-    enqueue();
+    try {
+        enqueue();
+    } catch (...) {
+        seg->owner = {nullptr, -1};
+        if (owner_added) info->owners.erase(owner);
+        return false;
+    }
     return true;
 }
 
@@ -788,12 +782,6 @@ void SpdkWrapper::ControllerLoop() {
 
             if (state == State::Draining) {
                 if (!info->pending_owners.empty()) continue;
-                bool drained = true;
-                for (auto &[_, seg] : info->ns_seg) {
-                    if (!seg->owner.first)
-                        drained &= DrainClientQpair(seg.get());
-                }
-                if (!drained) continue;
             } else if (state == State::Backoff &&
                        std::chrono::steady_clock::now() < info->retry_at) {
                 continue;
@@ -858,8 +846,6 @@ void SpdkWrapper::ControllerLoop() {
                     seg->ns = ns;
             }
 
-            // FIFO publication and admission share ns_mutex. All Resumes are
-            // enqueued before new requests or another recovery can be admitted.
             for (const auto &owner : info->owners)
                 post_recovery_task_(owner, info, true);
             info->state = State::Ready;
