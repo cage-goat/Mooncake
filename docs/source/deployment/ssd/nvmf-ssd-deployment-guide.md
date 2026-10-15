@@ -292,11 +292,11 @@ The first three parameters together provide QoS control for SPDK NoF I/O.
 
 `MC_NOF_IO_TIMEOUT_MS` bounds I/O that the target neither completes nor fails
 (for example a target that stalls while its connection stays up). When a
-sub-I/O exceeds it, the worker that owns the segment disconnects the
-segment's io qpair locally, which completes every request still outstanding
-on that qpair as aborted, and the affected transfers fail only after all of
-their sub-I/Os have been reclaimed, so the caller's buffers are never
-reused while SPDK can still write into them. The qpair stays disconnected
-afterwards: further transfers to that segment fail immediately until the
-qpair is reconnected. Time spent waiting in Mooncake's own submission
-queue does not count toward the timeout.
+sub-I/O exceeds it, its owner worker requests controller recovery. Every
+worker sharing that controller stops submission and locally drains and frees
+its qpairs before the controller is reconnected. Affected transfers fail only
+after their submitted sub-I/Os have returned through completion callbacks;
+they are not replayed automatically. After recovery, subsequent transfers
+recreate qpairs on their owner workers using the existing segment handles.
+Time spent waiting in Mooncake's own submission queue does not count toward
+the timeout. Invalid values use the default; values above 3600000 ms are capped.

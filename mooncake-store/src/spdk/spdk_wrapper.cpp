@@ -128,18 +128,7 @@ struct nof_seg_handle {
 
     uint32_t block_size{0};
     bool disconnecting{false};
-    // Worker affinity is per pool; OpenNofSegment() caches handles across
-    // pools and probes. Keep these flags atomic for those shared accesses;
-    // qpair operations themselves still require serialization.
-    // Pending timeout set by NofIoTimeoutCallback(). Only the owning worker's
-    // non-null poll output acknowledges it; observer/probe polls leave it
-    // pending.
     std::atomic<bool> io_timed_out{false};
-    // AbortNofSegmentIo() disconnected the qpair and nothing has reconnected
-    // it since. A qpair disconnected this way still reports
-    // SPDK_NVME_QPAIR_FAILURE_NONE, so recovery logic must look here as well.
-    // Whoever reconnects the qpair must clear it.
-    std::atomic<bool> disconnected{false};
 };
 
 struct tr_info {
@@ -397,8 +386,9 @@ int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
                                                uint32_t complete_per_seg,
                                                bool *io_timed_out) {
     tls_polling_seg = seg;
-    int64_t ret = seg->qpair ?
-        spdk_nvme_qpair_process_completions(seg->qpair, complete_per_seg) : 0;
+    int64_t ret = seg->qpair ? spdk_nvme_qpair_process_completions(
+                                   seg->qpair, complete_per_seg)
+                             : 0;
     tls_polling_seg = nullptr;
     if (io_timed_out) {
         // Deliver and acknowledge pending timeout state, including a report
@@ -417,7 +407,7 @@ void SpdkWrapper::NofIoTimeoutCallback(void * /*cb_arg*/,
                                        uint16_t cid) {
     nof_seg_handle *seg = tls_polling_seg;
     if (qpair == nullptr) {
-        // Admin queue. Mooncake never polls it, so this is not expected.
+        // SPDK reports admin command timeouts with a null qpair.
         LOG(WARNING) << "NoF admin command cid " << cid << " timed out";
         return;
     }
@@ -431,18 +421,6 @@ void SpdkWrapper::NofIoTimeoutCallback(void * /*cb_arg*/,
     // process_completions is not allowed. The owner acts after the poll.
     seg->io_timed_out.store(true, std::memory_order_relaxed);
     VLOG(1) << "NoF I/O cid " << cid << " timed out on seg " << seg;
-}
-
-void SpdkWrapper::AbortNofSegmentIo(nof_seg_handle *seg_handle) {
-    if (!seg_handle || !seg_handle->qpair) {
-        return;
-    }
-    // Local teardown of the io connection. Every request still outstanding
-    // on the qpair is completed through its callback (ABORTED - SQ DELETION)
-    // and every request queued inside SPDK is failed as well; the target is
-    // not involved, so this is bounded even when it never answers again.
-    spdk_nvme_ctrlr_disconnect_io_qpair(seg_handle->qpair);
-    seg_handle->disconnected.store(true, std::memory_order_relaxed);
 }
 
 int SpdkWrapper::ParseTransPortStr(const std::string &tr_str, tr_info *info) {
@@ -549,8 +527,8 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str,
             if (io_timeout_ms > 0) {
                 // SPDK reports, from process_completions() on the polling
                 // thread, every request outstanding longer than this. The
-                // callback only flags the segment; the worker that owns the
-                // qpair aborts it (see AbortNofSegmentIo).
+                // callback only flags the segment. After polling, its owner
+                // requests coordinated controller recovery.
                 spdk_nvme_ctrlr_register_timeout_callback(
                     info->ctrlr, io_timeout_ms * 1000, io_timeout_ms * 1000,
                     NofIoTimeoutCallback, nullptr);
@@ -626,12 +604,6 @@ int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
     if (!seg_handle || !ptr || !lba_count || !seg_handle->qpair ||
         !seg_handle->ns) {
         return -1;
-    }
-
-    if (seg_handle->disconnected.load(std::memory_order_relaxed)) {
-        // Same result SPDK would give for a disconnected qpair, without
-        // building a request first.
-        return -ENXIO;
     }
 
     struct spdk_nvme_qpair *qpair = seg_handle->qpair;
@@ -877,6 +849,8 @@ bool SpdkWrapper::DrainClientQpair(nof_seg_handle *seg) {
     spdk_nvme_ctrlr_free_io_qpair(seg->qpair);
     seg->qpair = nullptr;
     seg->disconnecting = false;
+    // Clear any pending timeout notification from the freed qpair.
+    seg->io_timed_out.store(false, std::memory_order_relaxed);
     return true;
 }
 

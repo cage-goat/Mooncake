@@ -153,6 +153,7 @@ if(USE_NOF)
           spdk_nvme_ctrlr_register_timeout_callback
           spdk_nvme_ctrlr_is_active_ns
           spdk_nvme_ctrlr_get_ns
+          spdk_nvme_ns_get_sector_size
           spdk_nvme_ctrlr_alloc_io_qpair
           spdk_nvme_ctrlr_free_io_qpair
           spdk_nvme_detach

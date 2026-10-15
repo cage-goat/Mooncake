@@ -52,8 +52,8 @@ class SpdkWrapper {
      * during an earlier poll. A null output leaves the timeout pending.
      * SPDK measures MC_NOF_IO_TIMEOUT_MS from transport submission. Nothing
      * has been aborted at this point; the owner acts after this returns.
-     * Event acknowledgement does not serialize shared qpair operations or
-     * establish ownership across worker pools and direct probes.
+     * Client qpairs are exclusively owned by their bound worker. Probe-only
+     * connections cannot be shared with recoverable client controllers.
      */
     int64_t NvmePollProcessCompletion(nof_seg_handle *seg,
                                       uint32_t complete_per_seg,
@@ -142,22 +142,6 @@ class SpdkWrapper {
 
     int SetupClientQpairIfNeeded(nof_seg_handle *seg);
     bool DrainClientQpair(nof_seg_handle *seg);
-
-    /**
-     * @brief Abort every outstanding I/O of a NoF segment locally.
-     *
-     * Disconnects the segment's io qpair. SPDK then completes each request
-     * still outstanding on that qpair through its completion callback with
-     * ABORTED - SQ DELETION; with the pinned SPDK (v23.01, TCP and RDMA in
-     * the default synchronous mode) this happens before the call returns.
-     * Unlike the NVMe Abort admin command it needs no response from the
-     * target, so it also works when the target is stalled.
-     *
-     * The qpair stays disconnected: SubmitRequest() fails with -ENXIO until
-     * it is reconnected. Must be called from the thread that submits to and
-     * polls this segment, and never from inside a completion callback.
-     */
-    void AbortNofSegmentIo(nof_seg_handle *seg_handle);
 
    private:
     struct ProbeBuffer {

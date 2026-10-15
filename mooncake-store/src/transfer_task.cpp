@@ -91,16 +91,8 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
         reinterpret_cast<mooncake::SpdkNofSubTask*>(ctx);
     const bool failed = spdk_nvme_cpl_is_error(cpl);
     if (failed) {
-        if (sub_task->task->nof_qos->state ==
-            mooncake::SpdkNofSegmentState::kDraining) {
-            // Expected while a timed-out qpair is being aborted; the worker
-            // logs one summary for the whole drain.
-            VLOG(1) << "task_complete: I/O aborted "
-                    << spdk_nvme_cpl_get_status_string(&cpl->status);
-        } else {
-            LOG(ERROR) << "task_complete: I/O failed "
-                       << spdk_nvme_cpl_get_status_string(&cpl->status);
-        }
+        LOG(ERROR) << "task_complete: I/O failed "
+                   << spdk_nvme_cpl_get_status_string(&cpl->status);
     }
 
     auto* task = sub_task->task;
@@ -114,7 +106,8 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
             }
         } else {
             const uint64_t bytes =
-                static_cast<uint64_t>(sub_task->submit_lba_count) * task->block_size;
+                static_cast<uint64_t>(sub_task->submit_lba_count) *
+                task->block_size;
             if (op == mooncake::kSpdkNofOpWrite) {
                 task->metric->ObserveWrite(bytes);
             } else {
@@ -125,44 +118,6 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     mooncake::SpdkNofCompleteSubTask(sub_task, failed);
 }
 
-// Act on the stall state of a segment after it has been polled. Runs on the
-// worker thread that owns the segment's qpair, outside any completion
-// callback.
-static void HandleSpdkNofStall(int work_idx, mooncake::nof_seg_handle* seg,
-                               mooncake::SpdkNofQos& nof_qos,
-                               bool io_timed_out) {
-    using mooncake::SpdkNofSegmentState;
-    using mooncake::SpdkNofStallAction;
-    if (!io_timed_out && nof_qos.state == SpdkNofSegmentState::kActive) {
-        return;
-    }
-
-    SpdkNofStallAction action =
-        mooncake::SpdkNofAdvanceStallState(nof_qos, io_timed_out);
-    if (action == SpdkNofStallAction::kAbort) {
-        LOG(ERROR) << "work " << work_idx << ", seg " << seg
-                   << " NoF I/O timed out with inflight_read="
-                   << nof_qos.inflight_blocks[mooncake::kSpdkNofOpRead]
-                   << " inflight_write="
-                   << nof_qos.inflight_blocks[mooncake::kSpdkNofOpWrite]
-                   << " blocks, aborting the qpair locally";
-        // Completes every outstanding request through nvmf_io_complete; with
-        // SPDK v23.01 that happens before the call returns, so the segment
-        // normally drains right here.
-        mooncake::SpdkWrapper::GetInstance().AbortNofSegmentIo(seg);
-        action = mooncake::SpdkNofAdvanceStallState(nof_qos, false);
-    }
-    if (action == SpdkNofStallAction::kDrained) {
-        const auto drain_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - nof_qos.drain_started)
-                .count();
-        LOG(ERROR) << "work " << work_idx << ", seg " << seg << " drained "
-                   << nof_qos.drained_sub_io << " aborted sub-I/Os in "
-                   << drain_ms
-                   << " ms; the qpair stays disconnected until reconnected";
-    }
-}
 #endif
 namespace mooncake {
 namespace {
@@ -649,7 +604,6 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
-            if (nof_qos->state != SpdkNofSegmentState::kActive) continue;
             if (nof_qos->controller_state->phase != Phase::Running ||
                 nof_qos->Empty())
                 continue;
@@ -736,12 +690,23 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         for (auto& [seg, qos] : seg_to_qos) {
             if (qos->controller_state->phase != Phase::Running) continue;
             bool io_timed_out = false;
-            int64_t rc = wrapper.NvmePollProcessCompletion(seg, 0, &io_timed_out);
+            int64_t rc =
+                wrapper.NvmePollProcessCompletion(seg, 0, &io_timed_out);
             if (rc < 0) {
                 LOG(ERROR) << "poll completion error: ret " << rc;
+            }
+            if (io_timed_out) {
+                LOG(ERROR) << "nof_io_timeout worker_idx=" << work_idx
+                           << " seg_handle=" << seg
+                           << " inflight_read=" << qos->inflight_blocks[0]
+                           << " inflight_write=" << qos->inflight_blocks[1];
+            }
+            if (rc < 0 || io_timed_out) {
+                // Defer teardown until after polling. The recovery control
+                // task stops submission and drains every owner of this
+                // controller before the controller thread reconnects it.
                 wrapper.RequestRecovery(wrapper.GetController(seg));
             }
-            HandleSpdkNofStall(work_idx, seg, *qos, io_timed_out);
         }
 
         ctx.AdvanceCleanup();
@@ -763,7 +728,6 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << CountSpdkNofQueuedTasks(nof_qos->head[0])
                         << " queued_write="
                         << CountSpdkNofQueuedTasks(nof_qos->head[1])
-                        << " state=" << static_cast<int>(nof_qos->state)
                         << " total_outstanding_io=" << total_outstanding_io;
                 }
                 last_debug_snapshot = now;
