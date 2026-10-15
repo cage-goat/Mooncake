@@ -7,25 +7,28 @@
 # answering. Without an I/O timeout the client's put/get blocks forever on the
 # SPDK future. With it, the client must fail within MC_NOF_IO_TIMEOUT_MS plus a
 # margin, the worker must reclaim every outstanding sub-I/O before the caller
-# is told, and the client must keep serving requests afterwards (fail-fast on
-# the disconnected qpair, no crash, no data mismatch).
+# is told, and the client must recover successful put/get after the target
+# resumes, without a crash or data mismatch.
 #
 # Runs NoF-only (CLIENT_GLOBAL_SEGMENT_SIZE=0) so a memory replica cannot hide
-# a stuck NoF transfer. Needs an SPDK build under extern/spdk, hugepages and
-# passwordless sudo like the heartbeat e2e. The whole run is bounded by
-# RUN_TIMEOUT_SEC through an outer watchdog, so a regression cannot hang CI.
+# a stuck NoF transfer. Needs an SPDK build and access to existing hugepages.
+# The whole run is bounded by RUN_TIMEOUT_SEC through an outer watchdog.
+# Setup and cleanup only affect this runner's own processes and RPC socket.
 set -euo pipefail
 
 RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-300}
 if [[ -z "${NOF_STALL_E2E_CHILD:-}" ]]; then
   export NOF_STALL_E2E_CHILD=1
-  exec timeout --foreground -k 10 "$RUN_TIMEOUT_SEC" "$BASH" "$0" "$@"
+  exec timeout --foreground -k 20 "$RUN_TIMEOUT_SEC" "$BASH" "$0" "$@"
 fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 BUILD_DIR=${BUILD_DIR:-"$REPO_ROOT/build"}
-LOG_DIR=${LOG_DIR:-/tmp/mooncake_nof_stalled_io_e2e}
+SPDK_DIR=${SPDK_DIR:-"$REPO_ROOT/extern/spdk"}
+LOG_DIR=${LOG_DIR:-$(mktemp -d /tmp/mooncake_nof_stalled_io_e2e.XXXXXX)}
+CLIENT_HOSTNAME=${CLIENT_HOSTNAME:-127.0.0.1:50071}
+export LD_LIBRARY_PATH="$BUILD_DIR/mooncake-common${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 MASTER_RPC=${MASTER_RPC:-127.0.0.1:50051}
 MASTER_HOST=${MASTER_RPC%:*}
 MASTER_PORT=${MASTER_RPC##*:}
@@ -34,7 +37,7 @@ METADATA_PORT=${METADATA_PORT:-8080}
 METADATA_SERVER="http://$METADATA_HOST:$METADATA_PORT/metadata"
 TARGET_HOST=${TARGET_HOST:-127.0.0.1}
 TARGET_PORT=${TARGET_PORT:-4420}
-TARGET_NQN=${TARGET_NQN:-nqn.2016-06.io.spdk:cnode1}
+TARGET_NQN=${TARGET_NQN:-nqn.2016-06.io.spdk:mooncake-stalled-$$}
 NOF_SIZE=${NOF_SIZE:-67108864}
 PAYLOAD_SIZE=${PAYLOAD_SIZE:-4096}
 CLIENT_DURATION=${CLIENT_DURATION:-0}
@@ -60,17 +63,36 @@ TARGET_PID=""
 MASTER_PID=""
 META_PID=""
 CLIENT_PID=""
+RPC_DIR=""
+RPC_SOCKET=""
+source "$SCRIPT_DIR/nof_target.sh"
+
+stop_child() {
+  local pid=$1 i
+  [[ -n "$pid" ]] || return 0
+  kill -TERM -- "-$pid" 2>/dev/null || true
+  for ((i=0; i<50; ++i)); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -KILL -- "-$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
 
 cleanup() {
-  [[ -n "$CLIENT_PID" ]] && kill "$CLIENT_PID" >/dev/null 2>&1 || true
-  [[ -n "$MASTER_PID" ]] && kill "$MASTER_PID" >/dev/null 2>&1 || true
-  if [[ -n "$TARGET_PID" ]]; then
-    kill -CONT "$TARGET_PID" >/dev/null 2>&1 || true
-    kill "$TARGET_PID" >/dev/null 2>&1 || true
-  fi
-  [[ -n "$META_PID" ]] && kill "$META_PID" >/dev/null 2>&1 || true
+  local rc=$?
+  trap - EXIT
+  [[ -z "$TARGET_PID" ]] || kill -CONT "$TARGET_PID" 2>/dev/null || true
+  stop_child "$CLIENT_PID"
+  stop_child "$MASTER_PID"
+  stop_child "$META_PID"
+  nof_target_stop
+  [[ -z "$RPC_DIR" ]] || rmdir "$RPC_DIR" 2>/dev/null || true
+  exit "$rc"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 count_pattern() {
   local file=$1
@@ -104,37 +126,20 @@ fail() {
   exit 1
 }
 
-rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR"
-
-sudo -n sh -c 'echo 512 > /proc/sys/vm/nr_hugepages'
-sudo -n umount /dev/hugepages >/dev/null 2>&1 || true
-sudo -n mkdir -p /dev/hugepages
-sudo -n mount -t hugetlbfs -o pagesize=2M,mode=1777 none /dev/hugepages
+[[ -z "$(ls -A "$LOG_DIR")" ]] || { echo "LOG_DIR must be empty" >&2; exit 2; }
+RPC_DIR=$(mktemp -d /tmp/nof-stalled-rpc.XXXXXX)
+RPC_SOCKET="$RPC_DIR/spdk.sock"
 grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo >"$LOG_DIR/hugepages.log"
+nof_target_start "$LOG_DIR/target.log"
+nof_target_add_malloc_ns 1 64 4096
+nof_target_start_listener
 
-pkill -f '/nvmf_tgt' >/dev/null 2>&1 || true
-pkill -f 'mooncake_master' >/dev/null 2>&1 || true
-pkill -f 'http_metadata_server.py' >/dev/null 2>&1 || true
-sleep 1
-
-"$REPO_ROOT/extern/spdk/build/bin/nvmf_tgt" -m 0x1 -u --iova-mode=va --wait-for-rpc >"$LOG_DIR/target.log" 2>&1 &
-TARGET_PID=$!
-sleep 3
-
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" framework_start_init >/dev/null
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" framework_wait_init >/dev/null
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" bdev_malloc_create -b Malloc0 64 4096 >/dev/null
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_create_transport -t TCP >/dev/null || true
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_create_subsystem "$TARGET_NQN" -a -s SPDK00000000000001 >/dev/null || true
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_ns "$TARGET_NQN" Malloc0 >/dev/null || true
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_listener "$TARGET_NQN" -t tcp -a "$TARGET_HOST" -s "$TARGET_PORT" >/dev/null || true
-
-python3 "$REPO_ROOT/mooncake-wheel/mooncake/http_metadata_server.py" --host "$METADATA_HOST" --port "$METADATA_PORT" >"$LOG_DIR/metadata.log" 2>&1 &
+setsid python3 "$REPO_ROOT/python/mooncake/http_metadata_server.py" --host "$METADATA_HOST" --port "$METADATA_PORT" >"$LOG_DIR/metadata.log" 2>&1 &
 META_PID=$!
 sleep 2
 
-"$BUILD_DIR/mooncake-store/src/mooncake_master" \
+setsid "$BUILD_DIR/mooncake-store/src/mooncake_master" \
   --rpc_address="$MASTER_HOST" \
   --rpc_port="$MASTER_PORT" \
   --enable_http_metadata_server=false \
@@ -164,8 +169,8 @@ PY
 # the timeout/drain messages into client.log next to the put/get results.
 PYTHONPATH="$BUILD_DIR/mooncake-integration" \
 MC_NOF_IO_TIMEOUT_MS="$IO_TIMEOUT_MS" MC_NOF_DEBUG=1 GLOG_logtostderr=1 \
-python3 "$SCRIPT_DIR/store_client_e2e.py" \
-  --local-hostname "127.0.0.1:50071" \
+setsid python3 "$SCRIPT_DIR/store_client_e2e.py" \
+  --local-hostname "$CLIENT_HOSTNAME" \
   --metadata-server "$METADATA_SERVER" \
   --master-server "$MASTER_RPC" \
   --global-segment-size "$CLIENT_GLOBAL_SEGMENT_SIZE" \
@@ -197,7 +202,13 @@ fi
 # --- stall: the target stops answering but its connection stays up ---------
 pre_stall_line_count=$(wc -l <"$LOG_DIR/client.log")
 kill -STOP "$TARGET_PID"
+deadline=$((SECONDS + 5))
+until grep -q '^State:.*T' "/proc/$TARGET_PID/status"; do
+  (( SECONDS < deadline )) || fail "target did not stop"
+  sleep 0.01
+done
 stall_start=$SECONDS
+date -u +%FT%TZ >"$LOG_DIR/stall-start.txt"
 
 stall_window_sec=$(( IO_TIMEOUT_MS / 1000 + STALL_SLACK_SEC ))
 first_failure_sec=-1
@@ -213,8 +224,11 @@ if (( first_failure_sec < 0 )); then
   fail "client I/O still unresolved ${stall_window_sec}s after the target was suspended (MC_NOF_IO_TIMEOUT_MS=$IO_TIMEOUT_MS); this is the #3864 hang"
 fi
 
-timeout_lines=$(count_pattern "$LOG_DIR/client.log" 'NoF I/O timed out')
-drained_lines=$(count_pattern "$LOG_DIR/client.log" 'aborted sub-I/Os')
+timeout_lines=$(tail -n "+$((pre_stall_line_count + 1))" "$LOG_DIR/client.log" | grep -c 'nof_io_timeout ' || true)
+drained_lines=$(tail -n "+$((pre_stall_line_count + 1))" "$LOG_DIR/client.log" | grep -c 'task_complete: I/O failed ABORTED - SQ DELETION' || true)
+recovery_lines=$(tail -n "+$((pre_stall_line_count + 1))" "$LOG_DIR/client.log" | grep -c 'nof_recovery begin ' || true)
+(( recovery_lines > 0 )) || fail "No controller recovery after timeout"
+grep -q '^State:.*T' "/proc/$TARGET_PID/status" || fail "target resumed before timeout/drain verification"
 if (( timeout_lines <= 0 || drained_lines <= 0 )); then
   fail "client failed the I/O but the worker did not report a timeout + drain (timed_out=$timeout_lines drained=$drained_lines)"
 fi
@@ -222,8 +236,8 @@ if (( $(count_pattern "$LOG_DIR/client.log" 'outstanding io < 0') > 0 || $(count
   fail "sub-I/O accounting went negative during the drain"
 fi
 
-# --- after the timeout: the client must keep going, fail-fast on the dead
-# qpair, and the worker's accounting must be back at zero -------------------
+# --- after the timeout: requests must keep completing during recovery,
+# and the worker's accounting must return to zero -------------------------
 post_timeout_line_count=$(wc -l <"$LOG_DIR/client.log")
 observation_deadline=$((SECONDS + POST_TIMEOUT_OBSERVATION_SEC))
 post_timeout_results=0
@@ -245,15 +259,15 @@ fi
 last_qos_state=$(grep 'nof_qos_state' "$LOG_DIR/client.log" | tail -n 1 || true)
 if [[ -n "$last_qos_state" ]]; then
   if ! grep -q 'inflight_read=0 inflight_write=0' <<<"$last_qos_state" || \
-     ! grep -q 'state=0' <<<"$last_qos_state" || \
      ! grep -q 'total_outstanding_io=0' <<<"$last_qos_state"; then
     fail "worker accounting did not return to baseline: $last_qos_state"
   fi
 else
-  echo "warning: no nof_qos_state snapshot found in client.log"
+  fail "no nof_qos_state snapshot found in client.log"
 fi
 
-# --- resume the target: nothing may crash on either side --------------------
+# --- resume the target: verify successful reads and writes ----------------
+date -u +%FT%TZ >"$LOG_DIR/resume-start.txt"
 kill -CONT "$TARGET_PID"
 sleep 3
 if ! kill -0 "$TARGET_PID" >/dev/null 2>&1; then
@@ -267,8 +281,15 @@ sleep 5
 post_resume_results=$(count_results_after "$LOG_DIR/client.log" "$post_resume_line_count" any)
 post_resume_successes=$(count_results_after "$LOG_DIR/client.log" "$post_resume_line_count" ok)
 
-kill "$CLIENT_PID" >/dev/null 2>&1 || true
-wait "$CLIENT_PID" >/dev/null 2>&1 || true
+(( post_resume_successes >= PRE_FAULT_SUCCESS_TARGET * 2 )) || fail "I/O did not recover after resume"
+post_resume_gets=$(awk -v start="$post_resume_line_count" 'NR > start && /^get_ok / {n++} END {print n+0}' "$LOG_DIR/client.log")
+(( post_resume_gets >= PRE_FAULT_SUCCESS_TARGET )) || fail "No verified reads after resume"
+(( $(count_pattern "$LOG_DIR/client.log" 'data_mismatch') == 0 )) || fail "data mismatch after recovery"
+if grep -q 'action=unmount_nof_segment_by_heartbeat' "$LOG_DIR/master.log"; then
+  fail "Master heartbeat removed the segment during the test"
+fi
+grep -q 'nof_recovery ready ' "$LOG_DIR/client.log" || fail "controller did not recover"
+stop_child "$CLIENT_PID"
 CLIENT_PID=""
 
 {
@@ -287,9 +308,11 @@ CLIENT_PID=""
   echo "first_failure_sec_after_stall=$first_failure_sec"
   echo "timeout_lines=$timeout_lines"
   echo "drained_lines=$drained_lines"
+  echo "recovery_lines=$recovery_lines"
   echo "post_timeout_results=$post_timeout_results"
   echo "post_resume_results=$post_resume_results"
   echo "post_resume_successes=$post_resume_successes"
+  echo "post_resume_gets=$post_resume_gets"
   echo "last_qos_state=$last_qos_state"
   echo "pre_fault_put_ok=$put_ok_count"
   echo "pre_fault_get_ok=$get_ok_count"
@@ -297,3 +320,5 @@ CLIENT_PID=""
 } >"$LOG_DIR/summary.log"
 
 cat "$LOG_DIR/summary.log"
+
+echo "PASS nof_stalled_io payload_size=$PAYLOAD_SIZE first_failure_sec=$first_failure_sec post_resume_gets=$post_resume_gets logs=$LOG_DIR"
