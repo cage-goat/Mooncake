@@ -369,6 +369,9 @@ NofWorkerPool::~NofWorkerPool() {
     }
 
     for (int i = 0; i < worker_count_; ++i) {
+        // Synchronize with the predicate-check -> wait transition. The atomic
+        // shutdown flag alone does not prevent a notification from being lost.
+        std::lock_guard<std::mutex> lock(queue_mutex_[i]);
         queue_cv_[i].notify_all();
     }
 
