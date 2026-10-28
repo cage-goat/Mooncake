@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "nof/nof_runtime.h"
+#include "random.h"
 #include "transfer_task.h"
 
 constexpr uint64_t KiB = 1024;
@@ -71,7 +72,8 @@ DEFINE_uint64(range_bytes, 1 * GiB,
 DEFINE_uint64(size, 0, "fio-style alias for --range_bytes.");
 DEFINE_bool(random_lba, false,
             "Whether to choose LBA randomly inside the per-endpoint range.");
-DEFINE_uint64(seed, 1, "Random seed used when --random_lba or --op=mixed.");
+DEFINE_uint64(seed, 1,
+              "Random seed used for LBA/op selection and buffer initialization.");
 DEFINE_uint64(warmup_sec, 3,
               "Warmup duration in seconds before measurement starts.");
 DEFINE_uint64(ramp_time, 0, "fio-style alias for --warmup_sec.");
@@ -92,6 +94,9 @@ DEFINE_int32(socket_id, -1,
              "NUMA socket for benchmark buffers. -1 lets SPDK choose.");
 DEFINE_bool(fill_on_write, true,
             "Fill buffers with a deterministic pattern for write/mixed ops.");
+DEFINE_bool(random_init, false,
+            "Initialize buffers with pseudo-random bytes before timing. Use "
+            "--fill_on_write=false to preserve this data for writes.");
 
 namespace {
 
@@ -334,6 +339,7 @@ CounterSnapshot DeltaCounters(const CounterSnapshot &current,
 uint64_t NextLba(EndpointContext &endpoint, bool random_lba);
 int PickTaskOp(BenchOp op_mode, std::mt19937_64 &rng);
 void FillPattern(void *buffer, size_t size, uint64_t seq);
+void FillRandom(void *buffer, size_t size, mooncake::RandomEngine &rng);
 void PublishSubmit(LiveCounters &live);
 void PublishSuccess(LiveCounters &live, uint64_t io_bytes);
 void PublishFailure(LiveCounters &live);
@@ -516,6 +522,14 @@ void FillPattern(void *buffer, size_t size, uint64_t seq) {
     auto *ptr = reinterpret_cast<uint8_t *>(buffer);
     for (size_t i = 0; i < size; ++i) {
         ptr[i] = static_cast<uint8_t>((seq + i) & 0xff);
+    }
+}
+
+void FillRandom(void *buffer, size_t size, mooncake::RandomEngine &rng) {
+    auto *ptr = static_cast<uint8_t *>(buffer);
+    for (size_t i = 0; i < size; ++i) {
+        ptr[i] = static_cast<uint8_t>(
+            mooncake::randomUniform<uint16_t>(0, 255, rng));
     }
 }
 
@@ -796,6 +810,9 @@ int main(int argc, char **argv) {
                   << ", iodepth_per_endpoint=" << FLAGS_iodepth
                   << ", total_iodepth=" << total_iodepth
                   << ", submit_threads=" << effective_submit_threads
+                  << ", random_init=" << FLAGS_random_init
+                  << ", fill_on_write=" << FLAGS_fill_on_write
+                  << ", seed=" << FLAGS_seed
                   << ", warmup_sec=" << FLAGS_warmup_sec
                   << ", duration_sec=" << FLAGS_duration_sec;
         if (unique_handles.size() < endpoints.size()) {
@@ -823,6 +840,9 @@ int main(int argc, char **argv) {
                 std::move(thread_endpoint));
         }
 
+        // Keep buffer initialization outside the timed I/O loop and use a
+        // separate engine so it does not change the LBA/op random sequence.
+        mooncake::RandomEngine init_rng(FLAGS_seed);
         for (auto &thread_context : thread_contexts) {
             for (auto &thread_endpoint : thread_context.endpoints) {
                 for (auto &slot : thread_endpoint.slots) {
@@ -835,6 +855,9 @@ int main(int argc, char **argv) {
                         FreeThreadSlots(*runtime.dma_allocator,
                                         thread_contexts);
                         return 1;
+                    }
+                    if (FLAGS_random_init) {
+                        FillRandom(slot.buffer, slot.buffer_size, init_rng);
                     }
                 }
             }
@@ -962,6 +985,9 @@ int main(int argc, char **argv) {
                   << "\n";
         std::cout << "numjobs=" << effective_submit_threads << "\n";
         std::cout << "bs=" << FLAGS_io_size << "\n";
+        std::cout << "random_init=" << FLAGS_random_init << "\n";
+        std::cout << "fill_on_write=" << FLAGS_fill_on_write << "\n";
+        std::cout << "seed=" << FLAGS_seed << "\n";
         std::cout << "iodepth=" << FLAGS_iodepth << "\n";
         std::cout << "total_iodepth=" << total_iodepth << "\n";
         std::cout << "runtime=" << FLAGS_duration_sec << "\n";
