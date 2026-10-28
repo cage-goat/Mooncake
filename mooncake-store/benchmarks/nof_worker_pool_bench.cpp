@@ -72,6 +72,15 @@ DEFINE_uint64(range_bytes, 1 * GiB,
 DEFINE_uint64(size, 0, "fio-style alias for --range_bytes.");
 DEFINE_bool(random_lba, false,
             "Whether to choose LBA randomly inside the per-endpoint range.");
+DEFINE_bool(
+    random_lba_align_to_io_size, false,
+    "When --random_lba is enabled, choose only LBAs aligned to --io_size. "
+    "Requires --start_lba to be aligned to the I/O size.");
+DEFINE_uint64(
+    random_lba_alignment_bytes, 0,
+    "Explicit random-LBA alignment in bytes. 0 keeps legacy block-granular "
+    "sampling unless --random_lba_align_to_io_size is enabled. A non-zero "
+    "value takes precedence over --random_lba_align_to_io_size.");
 DEFINE_uint64(seed, 1,
               "Random seed used for LBA/op selection and buffer initialization.");
 DEFINE_uint64(warmup_sec, 3,
@@ -284,6 +293,7 @@ struct EndpointContext {
     uint32_t block_size{0};
     uint64_t range_blocks{0};
     uint64_t io_blocks{0};
+    uint64_t random_lba_alignment_blocks{1};
     uint64_t next_block{0};
     std::mt19937_64 rng;
 
@@ -491,9 +501,14 @@ uint64_t NextLba(EndpointContext &endpoint, bool random_lba) {
     }
 
     if (random_lba) {
-        std::uniform_int_distribution<uint64_t> dist(
-            0, endpoint.range_blocks - endpoint.io_blocks);
-        return FLAGS_start_lba + dist(endpoint.rng);
+        const uint64_t max_offset_blocks =
+            endpoint.range_blocks - endpoint.io_blocks;
+        const uint64_t max_alignment_index =
+            max_offset_blocks / endpoint.random_lba_alignment_blocks;
+        const uint64_t alignment_index = mooncake::randomUniform<uint64_t>(
+            0, max_alignment_index, endpoint.rng);
+        return FLAGS_start_lba +
+               alignment_index * endpoint.random_lba_alignment_blocks;
     }
 
     uint64_t lba = FLAGS_start_lba + endpoint.next_block;
@@ -706,6 +721,11 @@ int main(int argc, char **argv) {
             FLAGS_random_lba = parsed_rw.random_lba;
         }
 
+        const uint64_t effective_random_lba_alignment_bytes =
+            FLAGS_random_lba_alignment_bytes != 0
+                ? FLAGS_random_lba_alignment_bytes
+                : (FLAGS_random_lba_align_to_io_size ? FLAGS_io_size : 0);
+
         BenchOp op_mode = ParseBenchOp(FLAGS_op);
         if (FLAGS_endpoints.empty()) {
             LOG(ERROR) << "--endpoints is required";
@@ -721,6 +741,17 @@ int main(int argc, char **argv) {
         }
         if (FLAGS_duration_sec == 0) {
             LOG(ERROR) << "--duration_sec must be greater than 0";
+            return 1;
+        }
+        if (effective_random_lba_alignment_bytes != 0 && !FLAGS_random_lba) {
+            LOG(ERROR) << "Random-LBA alignment requires --random_lba=true "
+                          "or a random --rw mode";
+            return 1;
+        }
+        if (effective_random_lba_alignment_bytes > FLAGS_range_bytes) {
+            LOG(ERROR) << "Random-LBA alignment="
+                       << effective_random_lba_alignment_bytes
+                       << " exceeds --range_bytes=" << FLAGS_range_bytes;
             return 1;
         }
 
@@ -787,6 +818,28 @@ int main(int argc, char **argv) {
                     << endpoint.endpoint;
                 return 1;
             }
+            if (effective_random_lba_alignment_bytes != 0) {
+                if (effective_random_lba_alignment_bytes % endpoint.block_size !=
+                    0) {
+                    LOG(ERROR)
+                        << "Random-LBA alignment="
+                        << effective_random_lba_alignment_bytes
+                        << " is not a multiple of block size "
+                        << endpoint.block_size << " for endpoint "
+                        << endpoint.endpoint;
+                    return 1;
+                }
+                endpoint.random_lba_alignment_blocks =
+                    effective_random_lba_alignment_bytes / endpoint.block_size;
+            }
+            if (FLAGS_start_lba % endpoint.random_lba_alignment_blocks != 0) {
+                LOG(ERROR) << "--start_lba=" << FLAGS_start_lba
+                           << " is not aligned to "
+                           << effective_random_lba_alignment_bytes << " bytes ("
+                           << endpoint.random_lba_alignment_blocks
+                           << " blocks) for endpoint " << endpoint.endpoint;
+                return 1;
+            }
             unique_handles.insert(endpoint.seg_handle);
             endpoints.push_back(std::move(endpoint));
         }
@@ -813,6 +866,13 @@ int main(int argc, char **argv) {
                   << ", random_init=" << FLAGS_random_init
                   << ", fill_on_write=" << FLAGS_fill_on_write
                   << ", seed=" << FLAGS_seed
+                  << ", random_lba=" << FLAGS_random_lba
+                  << ", random_lba_align_to_io_size="
+                  << FLAGS_random_lba_align_to_io_size
+                  << ", random_lba_alignment_bytes="
+                  << FLAGS_random_lba_alignment_bytes
+                  << ", effective_random_lba_alignment_bytes="
+                  << effective_random_lba_alignment_bytes
                   << ", warmup_sec=" << FLAGS_warmup_sec
                   << ", duration_sec=" << FLAGS_duration_sec;
         if (unique_handles.size() < endpoints.size()) {
@@ -990,6 +1050,13 @@ int main(int argc, char **argv) {
         std::cout << "seed=" << FLAGS_seed << "\n";
         std::cout << "iodepth=" << FLAGS_iodepth << "\n";
         std::cout << "total_iodepth=" << total_iodepth << "\n";
+        std::cout << "random_lba=" << FLAGS_random_lba << "\n";
+        std::cout << "random_lba_align_to_io_size="
+                  << FLAGS_random_lba_align_to_io_size << "\n";
+        std::cout << "random_lba_alignment_bytes="
+                  << FLAGS_random_lba_alignment_bytes << "\n";
+        std::cout << "effective_random_lba_alignment_bytes="
+                  << effective_random_lba_alignment_bytes << "\n";
         std::cout << "runtime=" << FLAGS_duration_sec << "\n";
         std::cout << "completed_ops=" << total_measured.completed_ops << "\n";
         std::cout << "failed_ops=" << total_measured.failed_ops << "\n";
