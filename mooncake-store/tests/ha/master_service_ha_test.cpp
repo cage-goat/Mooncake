@@ -3952,6 +3952,58 @@ TEST_F(MasterServiceHATest, NoFRemountPreservesRestoredAllocationRanges) {
     }
 }
 
+TEST_F(MasterServiceHATest,
+       PersistedNoFRegistrationRestoresRangesWithoutRemount) {
+    constexpr size_t size = 4096;
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_nof_heartbeat_interval_sec(3600)
+                              .build());
+    const NoFSegmentInfo info{.segment_id = generate_uuid(),
+                              .client_id = generate_uuid(),
+                              .segment_name = "ns",
+                              .transport_endpoint = "endpoint",
+                              .base = 0,
+                              .capacity = 2 * size};
+    NoFDescriptor nof;
+    nof.buffer_descriptor = {size, info.base, "nvmeof",
+                             info.transport_endpoint};
+    Replica::Descriptor replica;
+    replica.id = 1;
+    replica.status = ReplicaStatus::COMPLETE;
+    replica.descriptor_variant = nof;
+    StandbyObjectMetadata metadata;
+    metadata.client_id = info.client_id;
+    metadata.size = size;
+    metadata.replicas = {replica};
+    StandbyMetadataStore store;
+    ASSERT_TRUE(store.RestoreMetadata(kDefaultTenant.value(), "old", metadata));
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(
+        store, DurablePrefix{1, 1}, {}, replica.id, 1, {info}));
+
+    const auto old = service.GetReplicaList("old", kDefaultTenant);
+    ASSERT_TRUE(old);
+    ASSERT_EQ(old->replicas.size(), 1u);
+    const auto& addr =
+        old->replicas.front().get_nof_descriptor().buffer_descriptor;
+    EXPECT_EQ(addr.transport_endpoint_, info.transport_endpoint);
+    EXPECT_EQ(addr.buffer_address_, info.base);
+    EXPECT_EQ(addr.size_, size);
+
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.nof_replica_num = 1;
+    auto added =
+        service.PutStart(info.client_id, "new", kDefaultTenant, size, config);
+    ASSERT_TRUE(added);
+    ASSERT_EQ(added->size(), 1u);
+    const auto& fresh = added->front().get_nof_descriptor().buffer_descriptor;
+    EXPECT_EQ(fresh.transport_endpoint_, info.transport_endpoint);
+    EXPECT_EQ(fresh.buffer_address_, info.base + size);
+    EXPECT_TRUE(service.PutEnd(info.client_id, "new", kDefaultTenant,
+                               ReplicaType::NOF_SSD));
+}
+
 TEST_F(MasterServiceHATest, NoFRemountKeepsRemovedRangeUntilFinalize) {
     constexpr size_t kObjectSize = 4096;
     constexpr uint64_t kRemoveSequence = 1;
