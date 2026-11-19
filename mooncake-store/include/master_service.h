@@ -2382,6 +2382,15 @@ class MasterService {
     tl::expected<void, ErrorCode> MountNoFSegmentLocked(
         const NoFSegment& segment, const UUID& client_id);
 
+    struct NoFRangeRestore {
+        std::vector<Replica*> replicas;
+        std::shared_ptr<BufferAllocatorBase> allocator;
+        std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+        void RebindReplicas();
+    };
+    tl::expected<void, ErrorCode> PrepareNoFMount(const NoFSegment& segment,
+                                                  NoFRangeRestore& restore);
+
     // NoF descriptors are quarantined until their occupied ranges have been
     // imported. Keep this separate from memory aliases on the same endpoint.
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>

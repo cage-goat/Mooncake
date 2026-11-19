@@ -1120,16 +1120,17 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
     return MountNoFSegmentLocked(segment, client_id);
 }
 
-tl::expected<void, ErrorCode> MasterService::MountNoFSegmentLocked(
-    const NoFSegment& segment, const UUID& client_id) {
-#ifndef USE_NOF
-    LOG(ERROR) << "client_id=" << client_id << ", segment_name=" << segment.name
-               << ", error=nof_pool_disabled";
-    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-#else
+void MasterService::NoFRangeRestore::RebindReplicas() {
+    for (size_t i = 0; i < replicas.size(); ++i) {
+        (void)replicas[i]->replace_nof_buffer(std::move(buffers[i]));
+    }
+}
+
+tl::expected<void, ErrorCode> MasterService::PrepareNoFMount(
+    const NoFSegment& segment, NoFRangeRestore& restore) {
     const bool restoring =
         standby_nof_allocator_keepalive_.contains(segment.te_endpoint);
-    std::vector<Replica*> replicas;
+    auto& [replicas, allocator, buffers] = restore;
     std::vector<LiveAllocation> allocations;
     bool invalid_range =
         segment.size == 0 ||
@@ -1173,8 +1174,6 @@ tl::expected<void, ErrorCode> MasterService::MountNoFSegmentLocked(
     if (invalid_range) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    std::shared_ptr<BufferAllocatorBase> allocator;
-    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
     if (restoring) {
         if (memory_allocator_type_ == BufferAllocatorType::OFFSET) {
             auto imported = ImportOffsetBufferAllocator(
@@ -1196,6 +1195,19 @@ tl::expected<void, ErrorCode> MasterService::MountNoFSegmentLocked(
             return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
         }
     }
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::MountNoFSegmentLocked(
+    const NoFSegment& segment, const UUID& client_id) {
+#ifndef USE_NOF
+    LOG(ERROR) << "client_id=" << client_id << ", segment_name=" << segment.name
+               << ", error=nof_pool_disabled";
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#else
+    NoFRangeRestore restore;
+    auto prepared = PrepareNoFMount(segment, restore);
+    if (!prepared) return prepared;
     ScopedNoFSegmentAccess nof_segment_access =
         nof_segment_manager_.getNoFSegmentAccess();
 
@@ -1204,10 +1216,11 @@ tl::expected<void, ErrorCode> MasterService::MountNoFSegmentLocked(
               << ", action=mount_segment, segment_name=" << segment.name;
 
     bool newly_registered = false;
-    auto err = nof_segment_access.MountSegment(segment, client_id, allocator,
-                                               buffers, &newly_registered);
+    auto err =
+        nof_segment_access.MountSegment(segment, client_id, restore.allocator,
+                                        restore.buffers, &newly_registered);
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        if (restoring) {
+        if (restore.allocator) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         // Return OK because this is an idempotent operation
@@ -1215,9 +1228,7 @@ tl::expected<void, ErrorCode> MasterService::MountNoFSegmentLocked(
     } else if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
-    for (size_t i = 0; i < replicas.size(); ++i) {
-        (void)replicas[i]->replace_nof_buffer(std::move(buffers[i]));
-    }
+    restore.RebindReplicas();
     standby_nof_allocator_keepalive_.erase(segment.te_endpoint);
     // Rebinding a pre-mounted endpoint keeps its original segment ID and owner.
     if (newly_registered) PersistNoFSegmentMountForHA(segment, client_id);
@@ -11989,11 +12000,42 @@ ErrorCode MasterService::RestoreNoFSegmentsForHA(
                             : ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
 #else
     if (segments.empty()) return ErrorCode::OK;
+    const auto to_segment = [](const NoFSegmentInfo& info) {
+        NoFSegment segment;
+        segment.id = info.segment_id;
+        segment.name = info.segment_name;
+        segment.te_endpoint = info.transport_endpoint;
+        segment.base = info.base;
+        segment.size = info.capacity;
+        return segment;
+    };
+    // Prepare imports before taking the segment lock or changing any
+    // registration.
+    std::unordered_map<std::string, NoFRangeRestore> restores;
+    for (const auto& info : segments) {
+        if (!standby_nof_allocator_keepalive_.contains(info.transport_endpoint))
+            continue;
+        auto [it, inserted] = restores.try_emplace(info.transport_endpoint);
+        if (!inserted) continue;
+        auto prepared = PrepareNoFMount(to_segment(info), it->second);
+        if (!prepared) return prepared.error();
+    }
     auto access = nof_segment_manager_.getNoFSegmentAccess();
     std::vector<MountedNoFSegmentSnapshot> existing;
     access.GetMountedSegments(existing);
+    // Fail before mounting any segments if an already-mounted endpoint
+    // needs to import restored replica ranges.
+    for (const auto& current : existing) {
+        if (restores.contains(current.segment.te_endpoint)) {
+            LOG(ERROR) << "Cannot restore NoF ranges into a mounted endpoint: "
+                       << current.segment.te_endpoint;
+            return ErrorCode::INVALID_PARAMS;
+        }
+    }
     std::vector<const NoFSegmentInfo*> mounted;
     const auto rollback = [&] {
+        // Release imported buffers before unmount removes their usage metrics.
+        restores.clear();
         // Only undo registrations created by this attempt. No HA events are
         // emitted for either restoration or its rollback.
         for (auto it = mounted.rbegin(); it != mounted.rend(); ++it) {
@@ -12025,13 +12067,13 @@ ErrorCode MasterService::RestoreNoFSegmentsForHA(
             rollback();
             return ErrorCode::INVALID_PARAMS;
         }
-        NoFSegment segment;
-        segment.id = info.segment_id;
-        segment.name = info.segment_name;
-        segment.te_endpoint = info.transport_endpoint;
-        segment.base = info.base;
-        segment.size = info.capacity;
-        auto err = access.MountSegment(segment, info.client_id);
+        const auto segment = to_segment(info);
+        auto it = restores.find(info.transport_endpoint);
+        auto err =
+            it == restores.end()
+                ? access.MountSegment(segment, info.client_id)
+                : access.MountSegment(segment, info.client_id,
+                                      it->second.allocator, it->second.buffers);
         if (err != ErrorCode::OK) {
             rollback();
             return err;
@@ -12039,6 +12081,10 @@ ErrorCode MasterService::RestoreNoFSegmentsForHA(
         mounted.push_back(&info);
         existing.push_back(
             {info.segment_id, info.client_id, segment, SegmentStatus::OK});
+    }
+    for (auto& [endpoint, restore] : restores) {
+        restore.RebindReplicas();
+        standby_nof_allocator_keepalive_.erase(endpoint);
     }
     return ErrorCode::OK;
 #endif
