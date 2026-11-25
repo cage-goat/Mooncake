@@ -80,6 +80,7 @@
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -111,8 +112,10 @@ DEFINE_uint64(warmup_operations, 100,
               "Number of warmup operations (default: 100)");
 DEFINE_uint64(num_threads, 1,
               "Number of threads for concurrent tests (default: 1)");
-DEFINE_string(storage_path, "/tmp/mooncake_bench_data",
-              "Storage directory path");
+DEFINE_string(
+    storage_path, "/tmp/mooncake_bench_data",
+    "Dedicated test directory (recursively cleared); --backend=bucket "
+    "also accepts comma-separated directories");
 DEFINE_uint64(capacity_gb, 20, "Storage capacity in GB (default: 20GB)");
 DEFINE_bool(bucket_aligned_direct_write, false,
             "bucket backend: write data files with O_DIRECT and 4 KiB-aligned "
@@ -844,16 +847,80 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
 // Utility Functions
 // ============================================================================
 
-void CleanupStoragePath(const std::string& path) {
-    if (fs::exists(path)) {
+// A root can be reached through a symlink stored inside another root even
+// when their final targets are disjoint. Clearing that root would unlink the
+// only access path before the benchmark opens its backend.
+bool UsesDirectoryEntryUnder(fs::path path, const std::set<fs::path>& roots) {
+    for (; path.has_relative_path(); path = path.parent_path()) {
+        const auto name = path.filename();
+        if (name.empty() || name == "." || name == "..") continue;
+        const auto parent = fs::weakly_canonical(path.parent_path());
+        if (roots.count(parent)) return true;
+        if (fs::is_symlink(path) &&
+            UsesDirectoryEntryUnder(parent / fs::read_symlink(path), roots)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ValidateBucketRoots(const std::vector<std::string>& roots) {
+    std::set<fs::path> directories;
+    for (const auto& root : roots) {
+        if (root.empty()) {
+            LOG(ERROR) << "Empty directory in --storage_path";
+            return false;
+        }
+        auto path = fs::weakly_canonical(fs::absolute(root));
+        if (!path.has_filename() && path != path.root_path()) {
+            path = path.parent_path();
+        }
+        if (!directories.insert(path).second) {
+            LOG(ERROR) << "Duplicate bucket directory: " << path;
+            return false;
+        }
+    }
+    const auto cwd = fs::current_path();
+    if (directories.count(cwd) || directories.count(cwd.root_path()) ||
+        UsesDirectoryEntryUnder(cwd, directories)) {
+        LOG(ERROR) << "Refusing to clear the current directory or an ancestor";
+        return false;
+    }
+    for (const auto& root : roots) {
+        if (UsesDirectoryEntryUnder(fs::absolute(root), directories)) {
+            LOG(ERROR) << "Access to bucket directory " << root
+                       << " depends on an entry that would be cleared";
+            return false;
+        }
+    }
+    return true;
+}
+
+void CleanupStoragePath(BackendType type, const std::string& storage_path) {
+    if (type == BackendType::BUCKET) {
+        const auto roots = mooncake::ResolveOffloadDiskPaths(storage_path);
+        // Prepare every directory before removing data from any of them.
+        for (const auto& root : roots) {
+            fs::create_directories(root);
+        }
+        for (const auto& root : roots) {
+            // Preserve the root itself (it can be a mount point or symlink).
+            for (const auto& entry : fs::directory_iterator(root)) {
+                fs::remove_all(entry.path());
+            }
+        }
+        return;
+    }
+
+    if (fs::exists(storage_path)) {
         std::error_code ec;
-        fs::remove_all(path, ec);
+        fs::remove_all(storage_path, ec);
         if (ec) {
-            LOG(WARNING) << "Failed to cleanup " << path << ": "
+            LOG(WARNING) << "Failed to cleanup " << storage_path << ": "
                          << ec.message();
         }
     }
-    fs::create_directories(path);
+    fs::create_directories(storage_path);
 }
 
 // Print system info (best effort)
@@ -999,7 +1066,7 @@ double BenchInit(BackendType type, const std::string& storage_path,
                  size_t capacity) {
     PrintHeader("INIT", type, 0, 0);
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(type, storage_path);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1035,7 +1102,7 @@ void BenchBatchOffload(BackendType type, const std::string& storage_path,
                        BenchmarkStats& stats) {
     PrintHeader("BATCH_OFFLOAD", type, value_size, batch_size);
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(type, storage_path);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1228,7 +1295,7 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
                     BenchmarkStats& stats) {
     PrintHeader("BATCH_LOAD", type, value_size, batch_size);
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(type, storage_path);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1423,7 +1490,7 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
                          BenchmarkStats& stats) {
     PrintHeader("CONCURRENT_LOAD", type, value_size, batch_size, num_threads);
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(type, storage_path);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1591,7 +1658,7 @@ void BenchIsExist(BackendType type, const std::string& storage_path,
                   BenchmarkStats& hit_stats, BenchmarkStats& miss_stats) {
     PrintHeader("IS_EXIST", type, 0, 0);
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(type, storage_path);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1737,7 +1804,7 @@ void BenchMixedRW(BackendType type, const std::string& storage_path,
     std::cout << "  Reader threads: " << read_threads << "\n";
     std::cout << "  Writer threads: " << write_threads << "\n";
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(type, storage_path);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1955,7 +2022,7 @@ void BenchChurn(BackendType type, const std::string& storage_path,
     PrintHeader("CHURN", type, value_size, batch_size);
     std::cout << "  Fill ratio: " << (fill_ratio * 100) << "%\n";
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(type, storage_path);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -2146,7 +2213,7 @@ void BenchRestart(BackendType type, const std::string& storage_path,
     PrintHeader("RESTART", type, value_size, 0);
     std::cout << "  Testing recovery with " << num_keys << " keys\n";
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(type, storage_path);
 
     DataGenerator gen;
     KeySet keys;
@@ -2370,21 +2437,31 @@ void RunAllBenchmarks(const std::string& storage_path, size_t capacity) {
 // Main
 // ============================================================================
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     google::InitGoogleLogging("StorageBackendBench");
     FLAGS_logtostderr = true;
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    std::string storage_path = FLAGS_storage_path;
+    const std::string storage_path = FLAGS_storage_path;
+    const bool all_backends = FLAGS_run_all || FLAGS_backend == "all";
+    const auto backend_type = all_backends ? BackendType::OFFSET_ALLOCATOR
+                                           : StringToBackendType(FLAGS_backend);
+    if (all_backends || backend_type == BackendType::BUCKET) {
+        const auto roots = mooncake::ResolveOffloadDiskPaths(storage_path);
+        if (all_backends &&
+            (roots.size() != 1 || roots.front() != storage_path)) {
+            LOG(ERROR)
+                << "All-backend mode requires one common storage directory";
+            return 1;
+        }
+        if (!ValidateBucketRoots(roots)) return 1;
+    }
     size_t capacity = FLAGS_capacity_gb * GB;
     CacheMode cache_mode = StringToCacheMode(FLAGS_cache_mode);
 
-    if (FLAGS_run_all) {
-        RunAllBenchmarks(storage_path, capacity);
-    } else if (FLAGS_backend == "all") {
+    if (all_backends) {
         RunAllBenchmarks(storage_path, capacity);
     } else {
-        BackendType backend_type = StringToBackendType(FLAGS_backend);
         BenchmarkStats stats;
 
         // Print full configuration (PR1 requirement)
@@ -2455,11 +2532,14 @@ int main(int argc, char** argv) {
 
     // Cleanup
     if (!FLAGS_skip_cleanup) {
-        CleanupStoragePath(storage_path);
+        CleanupStoragePath(backend_type, storage_path);
     }
 
     google::ShutdownGoogleLogging();
 
     // Return non-zero if corruption detected
     return total_failures > 0 ? 1 : 0;
+} catch (const fs::filesystem_error& error) {
+    LOG(ERROR) << error.what();
+    return 1;
 }
