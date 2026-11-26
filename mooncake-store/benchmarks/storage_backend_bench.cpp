@@ -1527,6 +1527,9 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
     KeySet keys;
     keys.Init(total_keys);
 
+    std::cout << "  Concurrent read verification: "
+              << (FLAGS_verify ? "enabled" : "disabled") << "\n";
+
     // Pre-populate data with verifiable content
     std::cout << "  Pre-populating " << total_keys << " keys...\n";
 
@@ -1617,7 +1620,6 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
             // ===
             std::unordered_map<std::string, mooncake::Slice> load_slices;
             load_slices.reserve(batch_size);
-            std::vector<size_t> batch_key_indices(batch_size);
 
             size_t batch = first_batch[t].value_or(0);
             start_latch.arrive_and_wait();
@@ -1626,10 +1628,10 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
                 // === SETUP OUTSIDE TIMED REGION ===
                 // Clear but preserve capacity (no reallocation)
                 load_slices.clear();
+                const size_t first_key = base_key_idx + batch * batch_size;
 
                 for (size_t i = 0; i < batch_size; ++i) {
-                    size_t key_idx = base_key_idx + batch * batch_size + i;
-                    batch_key_indices[i] = key_idx;
+                    size_t key_idx = first_key + i;
                     load_slices.emplace(
                         keys.Get(key_idx),
                         mooncake::Slice{local_buffers.Get(i), value_size});
@@ -1652,17 +1654,16 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
                 if (result) {
                     my_stats.RecordBytes(batch_size * value_size);
 
-                    // Verify data integrity
+                    if (!ShouldVerify(op, false)) continue;
                     for (size_t i = 0; i < batch_size; ++i) {
                         const char* data =
                             shifted_read
                                 ? static_cast<const char*>(
-                                      load_slices
-                                          .at(keys.Get(batch_key_indices[i]))
+                                      load_slices.at(keys.Get(first_key + i))
                                           .ptr)
                                 : local_buffers.Get(i);
                         if (!local_gen.VerifyBuffer(data, value_size,
-                                                    batch_key_indices[i])) {
+                                                    first_key + i)) {
                             my_stats.RecordChecksumFailure();
                         }
                     }
@@ -1671,6 +1672,7 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
                 }
             }
 
+            CheckVerification(my_stats.checksum_failures, "ConcurrentLoad");
             end_latch.count_down();
         });
     }
@@ -2481,6 +2483,11 @@ int main(int argc, char** argv) try {
     FLAGS_logtostderr = true;
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
+    if (FLAGS_verify && FLAGS_verify_rate == 0) {
+        LOG(ERROR)
+            << "--verify_rate must be positive when verification is enabled";
+        return 1;
+    }
     const std::string storage_path = FLAGS_storage_path;
     const bool all_backends = FLAGS_run_all || FLAGS_backend == "all";
     const auto backend_type = all_backends ? BackendType::OFFSET_ALLOCATOR
