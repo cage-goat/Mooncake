@@ -1109,7 +1109,10 @@ void BenchBatchOffload(BackendType type, const std::string& storage_path,
 
     CleanupStoragePath(type, storage_path);
 
-    auto backend = CreateBackend(type, storage_path, capacity);
+    const bool use_uring =
+        type == BackendType::BUCKET &&
+        mooncake::FileStorageConfig::FromEnvironment().use_uring;
+    auto backend = CreateBackend(type, storage_path, capacity, use_uring);
     if (!backend) {
         LOG(ERROR) << "Failed to create backend";
         return;
@@ -1181,6 +1184,7 @@ void BenchBatchOffload(BackendType type, const std::string& storage_path,
 
         // Start timer right before first measured op
         if (!is_warmup && !timer_started) {
+            std::cout << "Measured writes starting." << std::endl;
             stats.StartTimer();
             timer_started = true;
         }
@@ -1213,6 +1217,7 @@ void BenchBatchOffload(BackendType type, const std::string& storage_path,
     }
 
     stats.StopTimer();
+    std::cout << "Measured writes finished." << std::endl;
     stats.Finalize();
 
     // === WRITE VERIFICATION (after timing, sample readback) ===
@@ -1232,7 +1237,10 @@ void BenchBatchOffload(BackendType type, const std::string& storage_path,
             measured_key_start + num_operations * batch_size;
 
         BufferPool verify_buffers;
-        verify_buffers.Init(batch_size, value_size);
+        verify_buffers.Init(batch_size,
+                            use_uring && !FLAGS_bucket_aligned_direct_write
+                                ? value_size + kAlignment
+                                : value_size);
 
         size_t verified_keys = 0;
         size_t verification_failures = 0;
@@ -1259,8 +1267,10 @@ void BenchBatchOffload(BackendType type, const std::string& storage_path,
             auto result = backend->BatchLoad(load_batch);
             if (result) {
                 for (size_t i = 0; i < batch_size; ++i) {
-                    if (!gen.VerifyBuffer(verify_buffers.Get(i), value_size,
-                                          base_key + i)) {
+                    if (!gen.VerifyBuffer(
+                            static_cast<const char*>(
+                                load_batch.at(keys.Get(base_key + i)).ptr),
+                            value_size, base_key + i)) {
                         verification_failures++;
                         if (FLAGS_fail_fast) {
                             LOG(FATAL)
@@ -1847,7 +1857,11 @@ void BenchMixedRW(BackendType type, const std::string& storage_path,
 
     CleanupStoragePath(type, storage_path);
 
-    auto backend = CreateBackend(type, storage_path, capacity);
+    const bool write_only = read_threads == 0;
+    const bool use_uring =
+        write_only && type == BackendType::BUCKET &&
+        mooncake::FileStorageConfig::FromEnvironment().use_uring;
+    auto backend = CreateBackend(type, storage_path, capacity, use_uring);
     if (!backend) {
         LOG(ERROR) << "Failed to create backend";
         return;
@@ -1868,38 +1882,42 @@ void BenchMixedRW(BackendType type, const std::string& storage_path,
 
     // Pre-populate keys for reading
     size_t total_keys = num_operations * batch_size * total_threads;
-    size_t initial_keys = total_keys / 2;  // Pre-populate half
+    const size_t initial_keys = write_only ? 0 : total_keys / 2;
 
-    DataGenerator gen;
     KeySet keys;
     keys.Init(total_keys);
 
-    BufferPool setup_buffers;
-    setup_buffers.Init(batch_size, value_size);
+    if (!write_only) {
+        DataGenerator gen;
+        BufferPool setup_buffers;
+        setup_buffers.Init(batch_size, value_size);
 
-    std::cout << "  Pre-populating " << initial_keys << " keys...\n";
+        std::cout << "  Pre-populating " << initial_keys << " keys...\n";
 
-    for (size_t key_idx = 0; key_idx < initial_keys; key_idx += batch_size) {
-        for (size_t i = 0; i < batch_size && (key_idx + i) < initial_keys;
-             ++i) {
-            gen.FillBuffer(setup_buffers.Get(i), value_size, key_idx + i);
+        for (size_t key_idx = 0; key_idx < initial_keys;
+             key_idx += batch_size) {
+            for (size_t i = 0; i < batch_size && (key_idx + i) < initial_keys;
+                 ++i) {
+                gen.FillBuffer(setup_buffers.Get(i), value_size, key_idx + i);
+            }
+
+            std::unordered_map<std::string, std::vector<mooncake::Slice>>
+                batch_object;
+            for (size_t i = 0; i < batch_size && (key_idx + i) < initial_keys;
+                 ++i) {
+                batch_object[keys.Get(key_idx + i)] = {
+                    mooncake::Slice{setup_buffers.Get(i), value_size}};
+            }
+            backend->BatchOffload(
+                batch_object,
+                [](const std::vector<std::string>&,
+                   std::vector<mooncake::StorageObjectMetadata>&) {
+                    return mooncake::ErrorCode::OK;
+                });
         }
 
-        std::unordered_map<std::string, std::vector<mooncake::Slice>>
-            batch_object;
-        for (size_t i = 0; i < batch_size && (key_idx + i) < initial_keys;
-             ++i) {
-            batch_object[keys.Get(key_idx + i)] = {
-                mooncake::Slice{setup_buffers.Get(i), value_size}};
-        }
-        backend->BatchOffload(
-            batch_object, [](const std::vector<std::string>&,
-                             std::vector<mooncake::StorageObjectMetadata>&) {
-                return mooncake::ErrorCode::OK;
-            });
+        std::cout << "  Pre-population complete.\n";
     }
-
-    std::cout << "  Pre-population complete.\n";
 
     // === DROP CACHE AFTER PRE-POPULATION (before timed benchmark) ===
     CacheMode cache_mode = StringToCacheMode(FLAGS_cache_mode);
@@ -1918,6 +1936,7 @@ void BenchMixedRW(BackendType type, const std::string& storage_path,
     write_stats.InitThreads(write_threads, num_operations);
 
     std::atomic<size_t> next_write_key{initial_keys};
+    std::latch writers_ready(write_only ? write_threads : 0);
     std::latch start_latch(total_threads + 1);
     std::latch end_latch(total_threads);
     std::vector<std::thread> threads;
@@ -1983,24 +2002,28 @@ void BenchMixedRW(BackendType type, const std::string& storage_path,
             ThreadStats& my_stats = write_stats.GetThreadStats(t);
             my_stats.Reserve(num_operations);
 
+            if (write_only) {
+                for (size_t i = 0; i < batch_size; ++i) {
+                    local_gen.FillBuffer(local_buffers.Get(i), value_size,
+                                         t * batch_size + i);
+                }
+                writers_ready.count_down();
+            }
             start_latch.arrive_and_wait();
 
             for (size_t op = 0; op < num_operations; ++op) {
                 // Get unique keys for writing
                 size_t base_key = next_write_key.fetch_add(batch_size);
 
-                // Fill buffers
-                for (size_t i = 0; i < batch_size; ++i) {
-                    batch.key_indices[i] = base_key + i;
-                    local_gen.FillBuffer(local_buffers.Get(i), value_size,
-                                         batch.key_indices[i]);
-                }
-
-                // Build batch (allocation OK - outside timed region)
                 batch.ClearOffload();
                 for (size_t i = 0; i < batch_size; ++i) {
+                    const size_t key_idx = base_key + i;
+                    if (!write_only) {
+                        local_gen.FillBuffer(local_buffers.Get(i), value_size,
+                                             key_idx);
+                    }
                     batch.offload_batch.emplace(
-                        keys.Get(batch.key_indices[i] % keys.Size()),
+                        keys.Get(key_idx),
                         std::vector<mooncake::Slice>{
                             {local_buffers.Get(i), value_size}});
                 }
@@ -2031,12 +2054,17 @@ void BenchMixedRW(BackendType type, const std::string& storage_path,
         });
     }
 
+    if (write_only) {
+        writers_ready.wait();
+        std::cout << "Measured writes starting." << std::endl;
+    }
     read_stats.StartTimer();
     write_stats.StartTimer();
     start_latch.arrive_and_wait();
     end_latch.wait();
     read_stats.StopTimer();
     write_stats.StopTimer();
+    if (write_only) std::cout << "Measured writes finished." << std::endl;
 
     for (auto& t : threads) {
         t.join();
