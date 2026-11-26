@@ -79,6 +79,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
@@ -760,11 +761,13 @@ class DataGenerator {
         uint64_t val =
             key_index * 6364136223846793005ULL + 1442695040888963407ULL;
 
-        const uint64_t* ptr = reinterpret_cast<const uint64_t*>(buffer);
         size_t num_words = size / sizeof(uint64_t);
 
         for (size_t i = 0; i < num_words; ++i) {
-            if (ptr[i] != val) {
+            // Packed direct reads can return a byte-aligned value address.
+            uint64_t actual;
+            std::memcpy(&actual, buffer + i * sizeof(actual), sizeof(actual));
+            if (actual != val) {
                 return false;  // Mismatch
             }
             val = val * 6364136223846793005ULL + 1442695040888963407ULL;
@@ -807,8 +810,10 @@ class DataGenerator {
 // ============================================================================
 
 std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
-    BackendType type, const std::string& storage_path, size_t capacity_bytes) {
+    BackendType type, const std::string& storage_path, size_t capacity_bytes,
+    bool use_uring = false) {
     mooncake::FileStorageConfig config;
+    config.use_uring = use_uring;
     config.storage_filepath = storage_path;
     config.total_size_limit = capacity_bytes;
     config.total_keys_limit = 10'000'000;
@@ -1492,7 +1497,10 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
 
     CleanupStoragePath(type, storage_path);
 
-    auto backend = CreateBackend(type, storage_path, capacity);
+    const bool use_uring =
+        type == BackendType::BUCKET &&
+        mooncake::FileStorageConfig::FromEnvironment().use_uring;
+    auto backend = CreateBackend(type, storage_path, capacity, use_uring);
     if (!backend) {
         LOG(ERROR) << "Failed to create backend";
         return;
@@ -1525,6 +1533,10 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
     BufferPool setup_buffers;
     setup_buffers.Init(batch_size, value_size);
 
+    const auto roots = type == BackendType::BUCKET
+                           ? mooncake::ResolveOffloadDiskPaths(storage_path)
+                           : std::vector<std::string>{};
+    std::vector<std::optional<size_t>> first_batch(num_threads);
     for (size_t key_idx = 0; key_idx < total_keys; key_idx += batch_size) {
         // Fill buffers with verifiable data
         for (size_t i = 0; i < batch_size && (key_idx + i) < total_keys; ++i) {
@@ -1541,11 +1553,24 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
             batch_object.emplace(keys.Get(key_idx + i), std::move(slices));
         }
 
-        backend->BatchOffload(
+        auto offloaded = backend->BatchOffload(
             batch_object, [](const std::vector<std::string>&,
                              std::vector<mooncake::StorageObjectMetadata>&) {
                 return mooncake::ErrorCode::OK;
             });
+        // Each offload produces one bucket. During setup, find the first
+        // batch in each reader's range on its preferred root.
+        if (roots.size() > 1 && offloaded) {
+            const size_t batch = key_idx / batch_size;
+            const size_t reader = batch / ops_per_thread;
+            if (!first_batch[reader]) {
+                const fs::path root = roots[reader % roots.size()];
+                if (fs::exists(root /
+                               (std::to_string(*offloaded) + ".bucket"))) {
+                    first_batch[reader] = batch % ops_per_thread;
+                }
+            }
+        }
     }
 
     std::cout << "  Pre-population complete.\n";
@@ -1576,7 +1601,12 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
             // === PER-THREAD RESOURCES (allocated before timing) ===
             DataGenerator local_gen(42 + t);
             BufferPool local_buffers;
-            local_buffers.Init(batch_size, value_size);
+            // Packed values may start inside an aligned direct-I/O read.
+            const bool shifted_read =
+                use_uring && !FLAGS_bucket_aligned_direct_write;
+            local_buffers.Init(batch_size, shifted_read
+                                               ? value_size + kAlignment
+                                               : value_size);
 
             ThreadStats& my_stats = stats.GetThreadStats(t);
             my_stats.Reserve(ops_per_thread);
@@ -1589,6 +1619,7 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
             load_slices.reserve(batch_size);
             std::vector<size_t> batch_key_indices(batch_size);
 
+            size_t batch = first_batch[t].value_or(0);
             start_latch.arrive_and_wait();
 
             for (size_t op = 0; op < ops_per_thread; ++op) {
@@ -1597,12 +1628,14 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
                 load_slices.clear();
 
                 for (size_t i = 0; i < batch_size; ++i) {
-                    size_t key_idx = base_key_idx + op * batch_size + i;
+                    size_t key_idx = base_key_idx + batch * batch_size + i;
                     batch_key_indices[i] = key_idx;
                     load_slices.emplace(
                         keys.Get(key_idx),
                         mooncake::Slice{local_buffers.Get(i), value_size});
                 }
+
+                if (++batch == ops_per_thread) batch = 0;
 
                 // === TIMED REGION ===
                 auto start = std::chrono::steady_clock::now();
@@ -1621,8 +1654,14 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
 
                     // Verify data integrity
                     for (size_t i = 0; i < batch_size; ++i) {
-                        if (!local_gen.VerifyBuffer(local_buffers.Get(i),
-                                                    value_size,
+                        const char* data =
+                            shifted_read
+                                ? static_cast<const char*>(
+                                      load_slices
+                                          .at(keys.Get(batch_key_indices[i]))
+                                          .ptr)
+                                : local_buffers.Get(i);
+                        if (!local_gen.VerifyBuffer(data, value_size,
                                                     batch_key_indices[i])) {
                             my_stats.RecordChecksumFailure();
                         }
