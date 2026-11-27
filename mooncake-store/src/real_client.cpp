@@ -6472,22 +6472,22 @@ std::vector<int64_t> RealClient::batch_get_into(
 }
 
 std::vector<int64_t> RealClient::batch_get_into_host(
-    const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-    const std::vector<size_t>& sizes) {
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes) {
     return batch_get_into_impl(keys, buffers, sizes, true);
 }
 
 std::vector<int64_t> RealClient::batch_get_into_impl(
-    const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-    const std::vector<size_t>& sizes, bool host_destinations) {
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes, bool host_destinations) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() {
                 return read_into_buffers(keys, buffers, sizes,
                                          host_destinations);
             },
-            [this](const auto&) { return client_ != nullptr; },
-            [&](uint64_t latency_us, const auto& ret) {
+            [this](const auto &) { return client_ != nullptr; },
+            [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int64_t> py_results;
                 py_results.reserve(ret.size());
                 for (const auto &item : ret) {
@@ -6931,10 +6931,10 @@ RealClient::batch_get_into_internal(
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>> RealClient::read_into_buffers(
-    const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-    const std::vector<size_t>& sizes, bool host_destinations,
-    const std::vector<tl::expected<QueryResult, ErrorCode>>* initial_queries,
-    const LocalDiskOffloadReader& reader) {
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes, bool host_destinations,
+    const std::vector<tl::expected<QueryResult, ErrorCode>> *initial_queries,
+    const LocalDiskOffloadReader &reader) {
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     const auto num_keys = keys.size();
     if (!client_ || buffers.size() != num_keys || sizes.size() != num_keys) {
@@ -6947,7 +6947,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> RealClient::read_into_buffers(
         fetched = client_->BatchQuery(keys);
         initial_queries = &fetched;
     }
-    const auto& query_results = *initial_queries;
+    const auto &query_results = *initial_queries;
     if (query_results.size() != num_keys) {
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             num_keys, tl::unexpected(ErrorCode::INVALID_PARAMS));
@@ -7274,8 +7274,8 @@ std::vector<tl::expected<int64_t, ErrorCode>> RealClient::read_into_buffers(
     [[maybe_unused]] auto start_read_store_time =
         std::chrono::steady_clock::now();
     auto read_disk_group =
-        [&](const std::string& endpoint,
-            LocalDiskOffloadObjects& objects) -> tl::expected<void, ErrorCode> {
+        [&](const std::string &endpoint,
+            LocalDiskOffloadObjects &objects) -> tl::expected<void, ErrorCode> {
         if (reader) return reader(endpoint, objects);
         if (!host_destinations) {
             return batch_get_into_offload_object_internal(endpoint, objects);
@@ -7284,12 +7284,12 @@ std::vector<tl::expected<int64_t, ErrorCode>> RealClient::read_into_buffers(
         std::unordered_map<std::string, Slice> destinations;
         std::unordered_map<std::string, std::string> scoped_keys;
         if (file_storage_ && endpoint == local_rpc_addr) {
-            for (const auto& [key, slices] : objects) {
-                const auto& op = valid_local_disk_operations.at(key);
+            for (const auto &[key, slices] : objects) {
+                const auto &op = valid_local_disk_operations.at(key);
                 if (op.replica.get_local_disk_descriptor().client_id !=
                     client_->getClientId())
                     continue;
-                const auto& resolved = op.query_result.resolved_tenant_id;
+                const auto &resolved = op.query_result.resolved_tenant_id;
                 const TenantId tenant(resolved && !resolved->empty()
                                           ? *resolved
                                           : client_->tenant_id());
@@ -7306,7 +7306,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> RealClient::read_into_buffers(
         }
         LocalDiskOffloadObjects fallback;
         uint64_t direct_bytes = 0, fallback_bytes = 0;
-        for (const auto& [key, slices] : objects) {
+        for (const auto &[key, slices] : objects) {
             auto scoped = scoped_keys.find(key);
             if (scoped != scoped_keys.end() &&
                 direct_keys.contains(scoped->second)) {
