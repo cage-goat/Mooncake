@@ -6661,6 +6661,47 @@ std::vector<AlignedTestObject> MixedAlignedTestObjects() {
 
 }  // namespace
 
+#ifdef USE_URING
+TEST_F(StorageBackendTest, DirectHostReadSelectsOnlyExactAlignedRanges) {
+    io_uring ring;
+    if (io_uring_queue_init(2, &ring, 0) < 0)
+        GTEST_SKIP() << "io_uring is unavailable";
+    io_uring_queue_exit(&ring);
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig layout;
+    layout.aligned_direct_write = true;
+    BucketStorageBackend backend(config, layout);
+    ASSERT_TRUE(backend.Init());
+    std::vector<AlignedTestObject> objects;
+    objects.push_back(MakeAlignedTestObject("direct", {{0, 4096}}, 1));
+    objects.push_back(MakeAlignedTestObject("address", {{0, 4096}}, 2));
+    objects.push_back(MakeAlignedTestObject("tail", {{0, 4095}}, 3));
+    ASSERT_TRUE(backend.BatchOffload(BatchOf(objects), AcceptAll));
+    auto buf = AllocateAligned(5 * 4096);
+    ASSERT_NE(buf.get(), nullptr);
+    std::string expected(5 * 4096, '#');
+    std::memset(buf.get(), '#', expected.size());
+    std::unordered_map<std::string, Slice> dst{
+        {"direct", {buf.get() + 4096, 4096}},
+        {"address", {buf.get() + 8193, 4096}},
+        {"tail", {buf.get() + 16384, 4095}}};
+    auto read = backend.ReadAlignedHostValues(dst);
+    ASSERT_TRUE(read);
+    EXPECT_EQ(*read, std::unordered_set<std::string>{"direct"});
+    expected.replace(4096, 4096, objects.front().value);
+    EXPECT_EQ(std::string_view(buf.get(), expected.size()), expected);
+
+    // Metadata still describes the original object. An EOF during direct
+    // I/O must be a read failure, not an ineligible key to retry elsewhere.
+    fs::resize_file(OnlyBucketFile(data_path), 0);
+    read = backend.ReadAlignedHostValues(dst);
+    ASSERT_FALSE(read);
+    EXPECT_EQ(read.error(), ErrorCode::FILE_READ_FAIL);
+}
+#endif
+
 // The data file has the aligned layout, and only the key blocks, the partial
 // last blocks and the unaligned values were copied; aligned blocks went to
 // the file from the caller's buffers.
