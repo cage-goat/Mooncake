@@ -179,6 +179,12 @@ class RealClient : public PyClient {
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
 
+    // Like batch_get_into, but every destination must be CPU-writable.
+    // Aligned local Bucket values may be read directly into these buffers.
+    std::vector<int64_t> batch_get_into_host(
+        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+        const std::vector<size_t>& sizes);
+
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys
@@ -1348,6 +1354,17 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    std::vector<int64_t> batch_get_into_impl(
+        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+        const std::vector<size_t>& sizes, bool host_destinations);
+
+    std::vector<tl::expected<int64_t, ErrorCode>> read_into_buffers(
+        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+        const std::vector<size_t>& sizes, bool host_destinations,
+        const std::vector<tl::expected<QueryResult, ErrorCode>>*
+            initial_queries = nullptr,
+        const LocalDiskOffloadReader& reader = {});
+
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 

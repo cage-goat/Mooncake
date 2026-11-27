@@ -6468,11 +6468,26 @@ int RealClient::upsert_batch(const std::vector<std::string> &keys,
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
+    return batch_get_into_impl(keys, buffers, sizes, false);
+}
+
+std::vector<int64_t> RealClient::batch_get_into_host(
+    const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+    const std::vector<size_t>& sizes) {
+    return batch_get_into_impl(keys, buffers, sizes, true);
+}
+
+std::vector<int64_t> RealClient::batch_get_into_impl(
+    const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+    const std::vector<size_t>& sizes, bool host_destinations) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
-            [&]() { return batch_get_into_internal(keys, buffers, sizes); },
-            [this](const auto &) { return client_ != nullptr; },
-            [&](uint64_t latency_us, const auto &ret) {
+            [&]() {
+                return read_into_buffers(keys, buffers, sizes,
+                                         host_destinations);
+            },
+            [this](const auto&) { return client_ != nullptr; },
+            [&](uint64_t latency_us, const auto& ret) {
                 std::vector<int64_t> py_results;
                 py_results.reserve(ret.size());
                 for (const auto &item : ret) {
@@ -6902,28 +6917,7 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
                                     const std::vector<size_t> &sizes) {
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
-        LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
-                   << ", buffers=" << buffers.size()
-                   << ", sizes=" << sizes.size();
-        return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    if (keys.empty()) {
-        return {};
-    }
-
-    const auto query_results = client_->BatchQuery(keys);
-    return batch_get_into_internal(
-        keys, buffers, sizes, query_results,
-        [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
-            return batch_get_into_offload_object_internal(endpoint, objects);
-        });
+    return read_into_buffers(keys, buffers, sizes, false);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -6932,30 +6926,33 @@ RealClient::batch_get_into_internal(
     const std::vector<size_t> &sizes,
     const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
     const LocalDiskOffloadReader &local_disk_reader) {
+    return read_into_buffers(keys, buffers, sizes, false, &query_results,
+                             local_disk_reader);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>> RealClient::read_into_buffers(
+    const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+    const std::vector<size_t>& sizes, bool host_destinations,
+    const std::vector<tl::expected<QueryResult, ErrorCode>>* initial_queries,
+    const LocalDiskOffloadReader& reader) {
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
-    // Validate preconditions
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
+    const auto num_keys = keys.size();
+    if (!client_ || buffers.size() != num_keys || sizes.size() != num_keys) {
         return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            num_keys, tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-
-    if (keys.size() != buffers.size() || keys.size() != sizes.size() ||
-        keys.size() != query_results.size()) {
-        LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
-                   << ", buffers=" << buffers.size()
-                   << ", sizes=" << sizes.size()
-                   << ", query_results=" << query_results.size();
+    if (keys.empty()) return {};
+    std::vector<tl::expected<QueryResult, ErrorCode>> fetched;
+    if (!initial_queries) {
+        fetched = client_->BatchQuery(keys);
+        initial_queries = &fetched;
+    }
+    const auto& query_results = *initial_queries;
+    if (query_results.size() != num_keys) {
         return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            num_keys, tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-
-    const size_t num_keys = keys.size();
     std::vector<tl::expected<int64_t, ErrorCode>> results(num_keys);
-
-    if (num_keys == 0) {
-        return results;
-    }
 
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
@@ -7276,9 +7273,63 @@ RealClient::batch_get_into_internal(
     [[maybe_unused]] size_t offload_object_count = 0;
     [[maybe_unused]] auto start_read_store_time =
         std::chrono::steady_clock::now();
+    auto read_disk_group =
+        [&](const std::string& endpoint,
+            LocalDiskOffloadObjects& objects) -> tl::expected<void, ErrorCode> {
+        if (reader) return reader(endpoint, objects);
+        if (!host_destinations) {
+            return batch_get_into_offload_object_internal(endpoint, objects);
+        }
+
+        std::unordered_map<std::string, Slice> destinations;
+        std::unordered_map<std::string, std::string> scoped_keys;
+        if (file_storage_ && endpoint == local_rpc_addr) {
+            for (const auto& [key, slices] : objects) {
+                const auto& op = valid_local_disk_operations.at(key);
+                if (op.replica.get_local_disk_descriptor().client_id !=
+                    client_->getClientId())
+                    continue;
+                const auto& resolved = op.query_result.resolved_tenant_id;
+                const TenantId tenant(resolved && !resolved->empty()
+                                          ? *resolved
+                                          : client_->tenant_id());
+                auto scoped = tenant.MakeScopedKey(key);
+                destinations.emplace(scoped, slices.front());
+                scoped_keys.emplace(key, std::move(scoped));
+            }
+        }
+        std::unordered_set<std::string> direct_keys;
+        if (!destinations.empty()) {
+            auto read = file_storage_->ReadAlignedHostValues(destinations);
+            if (!read) return tl::unexpected(read.error());
+            direct_keys = std::move(*read);
+        }
+        LocalDiskOffloadObjects fallback;
+        uint64_t direct_bytes = 0, fallback_bytes = 0;
+        for (const auto& [key, slices] : objects) {
+            auto scoped = scoped_keys.find(key);
+            if (scoped != scoped_keys.end() &&
+                direct_keys.contains(scoped->second)) {
+                direct_bytes += slices.front().size;
+            } else {
+                fallback.emplace(key, slices);
+                fallback_bytes += slices.front().size;
+            }
+        }
+        if (!fallback.empty()) {
+            auto result =
+                batch_get_into_offload_object_internal(endpoint, fallback);
+            if (!result) return result;
+        }
+        VLOG(1) << "Host disk read completed: direct_keys="
+                << direct_keys.size() << " direct_bytes=" << direct_bytes
+                << " fallback_keys=" << fallback.size()
+                << " fallback_bytes=" << fallback_bytes;
+        return {};
+    };
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
-        auto batch_get_offload_result = local_disk_reader(
+        auto batch_get_offload_result = read_disk_group(
             offload_objects_it.first, offload_objects_it.second);
         if (!batch_get_offload_result) {
             LOG(ERROR) << "Batch get store object failed with error: "

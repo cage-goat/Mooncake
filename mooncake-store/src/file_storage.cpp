@@ -1542,6 +1542,25 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     return {};
 }
 
+tl::expected<std::unordered_set<std::string>, ErrorCode>
+FileStorage::ReadAlignedHostValues(
+    const std::unordered_map<std::string, Slice>& destinations) {
+    if (disk_fenced_) return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+    auto* bucket = dynamic_cast<BucketStorageBackend*>(storage_backend_.get());
+    if (!bucket) return std::unordered_set<std::string>{};
+    const auto start = std::chrono::steady_clock::now();
+    auto read = bucket->ReadAlignedHostValues(destinations);
+    if (read && !read->empty() && ssd_metric_) {
+        uint64_t bytes = 0;
+        for (const auto& key : *read) bytes += destinations.at(key).size;
+        RecordDiskRead(read->size(), bytes,
+                       std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count());
+    }
+    return read;
+}
+
 tl::expected<void, ErrorCode> FileStorage::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
     if (disk_fenced_) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -1560,16 +1579,21 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
         for (const auto& [key, slice] : batch_object) {
             total_bytes += slice.size;
         }
-        ssd_metric_->ssd_read_ops.inc(batch_object.size());
-        ssd_metric_->ssd_read_bytes.inc(total_bytes);
-        ssd_metric_->ssd_read_latency_us.observe(elapsed_time);
-        ssd_metric_->ssd_read_latency_summary.observe(elapsed_time);
-        ssd_metric_->ssd_total_ops.inc(batch_object.size());
-        ssd_metric_->ssd_total_bytes.inc(total_bytes);
-        ssd_metric_->ssd_total_latency_us.observe(elapsed_time);
-        ssd_metric_->ssd_total_latency_summary.observe(elapsed_time);
+        RecordDiskRead(batch_object.size(), total_bytes, elapsed_time);
     }
     return result;
+}
+
+void FileStorage::RecordDiskRead(size_t keys, uint64_t total_bytes,
+                                 uint64_t elapsed_time) {
+    ssd_metric_->ssd_read_ops.inc(keys);
+    ssd_metric_->ssd_read_bytes.inc(total_bytes);
+    ssd_metric_->ssd_read_latency_us.observe(elapsed_time);
+    ssd_metric_->ssd_read_latency_summary.observe(elapsed_time);
+    ssd_metric_->ssd_total_ops.inc(keys);
+    ssd_metric_->ssd_total_bytes.inc(total_bytes);
+    ssd_metric_->ssd_total_latency_us.observe(elapsed_time);
+    ssd_metric_->ssd_total_latency_summary.observe(elapsed_time);
 }
 
 tl::expected<void, ErrorCode> FileStorage::BatchLoadSpans(
@@ -1590,14 +1614,7 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoadSpans(
             (void)key;
             total_bytes += static_cast<int64_t>(span.slice.size);
         }
-        ssd_metric_->ssd_read_ops.inc(spans.size());
-        ssd_metric_->ssd_read_bytes.inc(total_bytes);
-        ssd_metric_->ssd_read_latency_us.observe(elapsed_time);
-        ssd_metric_->ssd_read_latency_summary.observe(elapsed_time);
-        ssd_metric_->ssd_total_ops.inc(spans.size());
-        ssd_metric_->ssd_total_bytes.inc(total_bytes);
-        ssd_metric_->ssd_total_latency_us.observe(elapsed_time);
-        ssd_metric_->ssd_total_latency_summary.observe(elapsed_time);
+        RecordDiskRead(spans.size(), total_bytes, elapsed_time);
     }
     return result;
 }

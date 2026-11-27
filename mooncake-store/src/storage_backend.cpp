@@ -1890,6 +1890,24 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     return {};
 }
 
+tl::expected<std::unordered_set<std::string>, ErrorCode>
+BucketStorageBackend::ReadAlignedHostValues(
+    const std::unordered_map<std::string, Slice>& destinations) {
+    std::unordered_set<std::string> direct_keys;
+#ifdef USE_URING
+    if (file_storage_config_.use_uring) {
+        std::unordered_map<std::string, StorageValueSpan> spans;
+        spans.reserve(destinations.size());
+        for (const auto& [key, dst] : destinations) {
+            spans.emplace(key, StorageValueSpan{0, dst.size, dst});
+        }
+        auto result = ReadBucketValues(spans, true, &direct_keys);
+        if (!result) return tl::unexpected(result.error());
+    }
+#endif
+    return direct_keys;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadSpans(
     std::unordered_map<std::string, StorageValueSpan>& spans) {
     return ReadBucketValues(spans, false);
@@ -1897,7 +1915,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadSpans(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
     std::unordered_map<std::string, StorageValueSpan>& spans,
-    bool require_exact_size) {
+    bool require_exact_size, std::unordered_set<std::string>* direct_keys) {
     // Step 1: Build read plan by copying metadata under lock
     // BucketReadGuard increments inflight_reads_ to prevent deletion during IO.
     // When the guard goes out of scope, it decrements the counter.
@@ -1963,6 +1981,29 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                            << ", length=" << dest_slice.size
                            << ", data_size=" << metadata.data_size;
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            if (direct_keys) {
+                // Caller-owned buffers cannot absorb a rounded-up read or
+                // return a shifted pointer. Pin the same bucket we check here.
+                if (!dest_slice.ptr)
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                const auto offset_mod =
+                    (static_cast<uint64_t>(metadata.offset) +
+                     static_cast<uint64_t>(metadata.key_size)) %
+                    kDirectIOAlignment;
+                if (offset_mod || !dest_slice.size ||
+                    dest_slice.size % kDirectIOAlignment ||
+                    reinterpret_cast<uintptr_t>(dest_slice.ptr) %
+                        kDirectIOAlignment) {
+                    VLOG(2) << "Host direct read ineligible: offset_mod="
+                            << offset_mod << " length=" << dest_slice.size
+                            << " address_mod="
+                            << reinterpret_cast<uintptr_t>(dest_slice.ptr) %
+                                   kDirectIOAlignment;
+                    continue;
+                }
+                direct_keys->insert(key);
             }
 
             // Create guard for this bucket if not already guarded

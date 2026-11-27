@@ -88,6 +88,12 @@ class FileStorage {
         const std::vector<int64_t>& lengths,
         const std::vector<int64_t>& object_sizes);
 
+    // Returns the keys read into their final destinations. Other keys must
+    // be fetched through the ordinary disk replica path.
+    tl::expected<std::unordered_set<std::string>, ErrorCode>
+    ReadAlignedHostValues(
+        const std::unordered_map<std::string, Slice>& destinations);
+
     tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
@@ -337,6 +343,8 @@ class FileStorage {
     void WakeHeartbeat();
 
     std::shared_ptr<Client> client_;
+    void RecordDiskRead(size_t keys, uint64_t total_bytes,
+                        uint64_t elapsed_time);
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
     // Pinned memory for GPU staging and SSD-to-GPU restores.

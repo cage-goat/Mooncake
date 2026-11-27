@@ -884,6 +884,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
+    tl::expected<std::unordered_set<std::string>, ErrorCode>
+    ReadAlignedHostValues(
+        const std::unordered_map<std::string, Slice>& destinations);
+
     tl::expected<void, ErrorCode> BatchLoadSpans(
         std::unordered_map<std::string, StorageValueSpan>& spans) override;
 
@@ -1031,7 +1035,8 @@ class BucketStorageBackend : public StorageBackendInterface {
    private:
     tl::expected<void, ErrorCode> ReadBucketValues(
         std::unordered_map<std::string, StorageValueSpan>& spans,
-        bool require_exact_size);
+        bool require_exact_size,
+        std::unordered_set<std::string>* direct_keys = nullptr);
 
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
